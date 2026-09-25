@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30">
+<title>DD-GUI</title>
+<path fill="#1C1C1F" d="M6.5 0h17a6.5 6.5 0 0 1 6.5 6.5v17a6.5 6.5 0 0 1 -6.5 6.5h-17a6.5 6.5 0 0 1 -6.5 -6.5v-17a6.5 6.5 0 0 1 6.5 -6.5Z"/>
+<path fill="#F2F2F3" fill-rule="evenodd" d="M4 18a5 5 0 1 0 10 0a5 5 0 1 0 -10 0ZM7.8 18a1.2 1.2 0 1 0 2.4 0a1.2 1.2 0 1 0 -2.4 0Z"/>
+<path fill="#F2F2F3" d="M11 7h3v16h-3Z"/>
+<path fill="#FF7A1A" fill-rule="evenodd" d="M16 18a5 5 0 1 0 10 0a5 5 0 1 0 -10 0ZM19.8 18a1.2 1.2 0 1 0 2.4 0a1.2 1.2 0 1 0 -2.4 0Z"/>
+<path fill="#FF7A1A" d="M23 7h3v16h-3Z"/>
+</svg>

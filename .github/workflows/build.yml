@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # An older Ubuntu keeps the glibc requirement low, so the binary runs on more distros.
+          - os: ubuntu-22.04
+            artifact: dd-gui-linux-x86_64
+            path: target/release/dd-gui
+          # build.rs embeds the icon and version info here (rc.exe comes with the Windows SDK).
+          - os: windows-latest
+            artifact: dd-gui-windows-x86_64
+            path: target/release/dd-gui.exe
+          - os: macos-latest
+            artifact: DD-GUI-macos-arm64
+            path: target/release/DD-GUI-macos-arm64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+      - run: cargo test --release
+      - run: cargo build --release
+
+      - name: Check the exe's version info
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $info = (Get-Item target/release/dd-gui.exe).VersionInfo
+          $info | Format-List ProductName, FileDescription, ProductVersion, FileVersion
+          if ($info.ProductName -ne 'DD-GUI') { throw 'dd-gui.exe is missing its icon and version info' }
+
+      - name: Bundle DD-GUI.app
+        if: runner.os == 'macOS'
+        run: |
+          # cargo pkgid prints e.g. path+file:///…/dd-gui#0.1.0 (or …#dd-gui@0.1.0)
+          id=$(cargo pkgid)
+          version=${id##*[#@]}
+          app=target/release/DD-GUI.app
+          rm -rf "$app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/dd-gui "$app/Contents/MacOS/dd-gui"
+          cp assets/DD-GUI.icns "$app/Contents/Resources/DD-GUI.icns"
+          sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          # Ad-hoc signature over the whole bundle, so macOS doesn't call the download "damaged".
+          codesign --force --sign - "$app"
+          # ditto keeps the executable bit and the signature; upload-artifact's own zip would not.
+          ditto -c -k --keepParent "$app" target/release/DD-GUI-macos-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error

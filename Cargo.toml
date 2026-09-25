@@ -1,0 +1,65 @@
+[package]
+name = "dd-gui"
+version = "0.1.0"
+edition = "2024"
+description = "A simple, good-looking GUI for dd, shipped as a single binary"
+repository = "https://github.com/Sir-MmD/dd-gui"
+homepage = "https://github.com/Sir-MmD/dd-gui"
+build = "build.rs"
+
+[dependencies]
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "accessibility",
+    "backend-winit",
+    "renderer-femtovg",
+    "renderer-software",
+    "software-renderer-path",
+    "raw-window-handle-06",
+] }
+# dd itself (uutils coreutils, MIT) compiled straight into the binary
+uu_dd = "0.12"
+uucore = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.17"
+# Smart images (.img.zst) and .zst restores: the official libzstd, multithreaded.
+zstd = { version = "0.14", features = ["zstdmt"] }
+# Other compressed images (`dd-gui copy`).
+# gzip decoding (zlib-rs backend)
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+# gzip encoding of data: fast, and stores incompressible blocks instead of growing them
+miniz_oxide = "0.9"
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz", "optimization"] }
+ruzstd = "0.9"
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+slint-build = "1.18"
+embed-manifest = "1.5"
+# DD-GUI.exe's icon and version info (build.rs only uses it for Windows targets)
+winresource = { version = "0.1.31", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

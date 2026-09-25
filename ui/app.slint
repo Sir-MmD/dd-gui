@@ -1,0 +1,1348 @@
+import { ListView, AboutSlint, Palette } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Btn, IconBtn, Toggle, Segmented, Chip, Field, Caption, ProgressRing, Spinner, Bars, Modal, ChoiceCard } from "widgets.slint";
+
+export { Theme }
+
+export struct DriveItem {
+    key: string,
+    name: string,
+    detail: string,
+    size: string,
+    // same numbering as Glyph
+    kind: int,
+    note: string,
+    disabled: bool,
+    selected: bool,
+}
+
+export struct Token {
+    key: string,
+    value: string,
+}
+
+// Every icon the Rust side can ask for, by number.
+component Glyph inherits Image {
+    // 0 image file, 1 USB, 2 SD card, 3 disk, 4 virtual disk, 5 zeros, 6 save as file
+    in property <int> glyph;
+    source: glyph == 1 ? @image-url("icons/usb.svg")
+        : glyph == 2 ? @image-url("icons/sd-card.svg")
+        : glyph == 3 ? @image-url("icons/hard-drive.svg")
+        : glyph == 4 ? @image-url("icons/box.svg")
+        : glyph == 5 ? @image-url("icons/binary.svg")
+        : glyph == 6 ? @image-url("icons/save.svg")
+        : @image-url("icons/disc-3.svg");
+}
+
+component EndpointCard inherits Rectangle {
+    in property <string> heading;
+    in property <[string]> modes;
+    in-out property <int> mode;
+    in property <bool> filled;
+    in property <int> glyph;
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> tag;
+    in property <bool> clickable: true;
+    callback activate();
+    callback mode-changed();
+
+    border-radius: Theme.radius;
+    background: touch.has-hover && clickable ? Theme.surface-hover : Theme.surface;
+    border-width: 1px;
+    border-color: touch.has-hover && clickable ? Theme.border-strong : Theme.border;
+    animate background, border-color { duration: Theme.quick; }
+
+    touch := TouchArea {
+        enabled: root.clickable;
+        mouse-cursor: root.clickable ? pointer : default;
+        clicked => { root.activate(); }
+    }
+
+    VerticalLayout {
+        padding: 22px;
+        padding-top: 18px;
+        HorizontalLayout {
+            height: 32px;
+            Caption {
+                text: root.heading;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Segmented {
+                options: root.modes;
+                selected <=> root.mode;
+                changed => { root.mode-changed(); }
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            min-height: 10px;
+        }
+        HorizontalLayout {
+            alignment: LayoutAlignment.start;
+            Rectangle {
+                width: 60px;
+                height: 60px;
+                border-radius: 14px;
+                background: root.filled ? Theme.accent-soft : Theme.raised;
+                animate background { duration: Theme.smooth; }
+                Glyph {
+                    x: 17px;
+                    y: 17px;
+                    width: 26px;
+                    height: 26px;
+                    glyph: root.glyph;
+                    colorize: root.filled ? Theme.accent : Theme.text-3;
+                }
+            }
+        }
+        Rectangle { height: 16px; }
+        Text {
+            text: root.title;
+            font-size: 18px;
+            font-weight: 600;
+            color: root.filled ? Theme.text : Theme.text-2;
+            overflow: elide;
+        }
+        Rectangle { height: 5px; }
+        Text {
+            text: root.subtitle;
+            font-size: 13px;
+            color: root.filled ? Theme.text-2 : Theme.text-3;
+            overflow: elide;
+        }
+        if root.tag != "": HorizontalLayout {
+            padding-top: 10px;
+            alignment: LayoutAlignment.start;
+            Chip {
+                text: root.tag;
+                fg: Theme.accent;
+                bg: Theme.accent-soft;
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            min-height: 10px;
+        }
+        HorizontalLayout {
+            height: 20px;
+            spacing: 4px;
+            alignment: LayoutAlignment.start;
+            opacity: root.clickable ? 1 : 0;
+            Text {
+                text: root.filled ? "Change" : "Choose";
+                color: Theme.accent;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            VerticalLayout {
+                alignment: center;
+                Image {
+                    source: @image-url("icons/chevron-right.svg");
+                    colorize: Theme.accent;
+                    width: 14px;
+                    height: 14px;
+                    x: touch.has-hover ? 3px : 0px;
+                    animate x { duration: Theme.quick; }
+                }
+            }
+        }
+    }
+}
+
+component Connector inherits Rectangle {
+    in property <bool> active;
+
+    width: 36px;
+    height: 36px;
+    border-radius: 18px;
+    background: active ? Theme.accent : Theme.surface;
+    border-width: active ? 0px : 1px;
+    border-color: Theme.border;
+    animate background { duration: Theme.smooth; }
+    Image {
+        x: 9px;
+        y: 9px;
+        width: 18px;
+        height: 18px;
+        source: @image-url("icons/arrow-right.svg");
+        colorize: root.active ? Theme.on-accent : Theme.text-3;
+    }
+}
+
+component CommandBar inherits Rectangle {
+    in property <[Token]> tokens;
+    in property <string> text;
+    in property <bool> customized;
+    callback advanced();
+    property <bool> copied;
+
+    height: 48px;
+    border-radius: 12px;
+    background: Theme.code;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    HorizontalLayout {
+        padding: 1px;
+        padding-left: 16px;
+        padding-right: 7px;
+        spacing: 4px;
+        Rectangle {
+            min-width: 0px;
+            preferred-width: 0px;
+            horizontal-stretch: 1;
+            clip: true;
+            HorizontalLayout {
+                x: 0px;
+                width: self.preferred-width;
+                spacing: 8px;
+                Text {
+                    text: "$";
+                    color: Theme.text-3;
+                    font-family: Theme.mono;
+                    font-size: 12.5px;
+                    vertical-alignment: center;
+                }
+                for token in root.tokens: HorizontalLayout {
+                    // "" marks commands, "_" plain arguments, anything else a dd operand
+                    if token.key != "" && token.key != "_": Text {
+                        text: token.key + "=";
+                        color: Theme.text-3;
+                        font-family: Theme.mono;
+                        font-size: 12.5px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: token.value;
+                        color: token.key == "" ? Theme.accent : Theme.text;
+                        font-family: Theme.mono;
+                        font-size: 12.5px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            // Fade out whatever doesn't fit.
+            Rectangle {
+                x: parent.width - self.width;
+                width: 56px;
+                background: @linear-gradient(90deg, Theme.code.transparentize(100%) 0%, Theme.code 85%);
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            IconBtn {
+                icon: @image-url("icons/sliders-horizontal.svg");
+                icon-size: 16px;
+                tint: Theme.text-3;
+                badge: root.customized;
+                clicked => { root.advanced(); }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            IconBtn {
+                icon: root.copied ? @image-url("icons/check.svg") : @image-url("icons/copy.svg");
+                icon-size: 16px;
+                tint: root.copied ? Theme.success : Theme.text-3;
+                hover-tint: root.copied ? Theme.success : Theme.text;
+                clicked => {
+                    clipboard.select-all();
+                    clipboard.copy();
+                    clipboard.clear-selection();
+                    root.copied = true;
+                }
+            }
+        }
+    }
+
+    // Slint copies to the clipboard through text inputs.
+    clipboard := TextInput {
+        text: root.text;
+        visible: false;
+        read-only: true;
+    }
+
+    Timer {
+        interval: 1600ms;
+        running: root.copied;
+        triggered => { root.copied = false; }
+    }
+}
+
+component Banner inherits Rectangle {
+    in property <string> text;
+    in property <bool> warning;
+
+    height: 40px;
+    border-radius: 10px;
+    background: warning ? Theme.warning-soft : Theme.raised;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Image {
+                width: 16px;
+                height: 16px;
+                source: root.warning ? @image-url("icons/triangle-alert.svg") : @image-url("icons/info.svg");
+                colorize: root.warning ? Theme.warning : Theme.text-2;
+            }
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            color: Theme.text;
+            font-size: 12.5px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+component Stat inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+
+    height: 68px;
+    border-radius: 12px;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+    VerticalLayout {
+        padding-left: 16px;
+        padding-right: 12px;
+        alignment: center;
+        spacing: 6px;
+        Caption { text: root.label; }
+        Text {
+            text: root.value;
+            color: Theme.text;
+            font-family: Theme.display;
+            font-size: 19px;
+            font-weight: 600;
+            overflow: elide;
+        }
+    }
+}
+
+component DriveRow inherits Rectangle {
+    in property <DriveItem> item;
+    callback picked(string);
+
+    height: 64px;
+    border-radius: 10px;
+    background: item.selected ? Theme.accent-soft : touch.has-hover && !item.disabled ? Theme.raised : transparent;
+    animate background { duration: Theme.quick; }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 14px;
+        spacing: 14px;
+        opacity: root.item.disabled ? 0.5 : 1;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 40px;
+                height: 40px;
+                border-radius: 10px;
+                background: root.item.selected ? Theme.accent-soft : Theme.raised;
+                Glyph {
+                    x: 10px;
+                    y: 10px;
+                    width: 20px;
+                    height: 20px;
+                    glyph: root.item.kind;
+                    colorize: root.item.selected ? Theme.accent : Theme.text-2;
+                }
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 3px;
+            Text {
+                text: root.item.name;
+                color: Theme.text;
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+            }
+            Text {
+                text: root.item.detail;
+                color: Theme.text-3;
+                font-family: Theme.mono;
+                font-size: 11px;
+                overflow: elide;
+            }
+        }
+        if root.item.note != "": VerticalLayout {
+            alignment: center;
+            Chip {
+                text: root.item.note;
+                fg: root.item.disabled ? Theme.text-2 : Theme.warning;
+                bg: root.item.disabled ? Theme.raised : Theme.warning-soft;
+            }
+        }
+        Text {
+            text: root.item.size;
+            color: Theme.text-2;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: !root.item.disabled;
+        mouse-cursor: root.item.disabled ? not-allowed : pointer;
+        clicked => { root.picked(root.item.key); }
+    }
+}
+
+component DialogHeader inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> subtitle;
+    callback close();
+
+    spacing: 6px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 4px;
+        Text {
+            text: root.title;
+            color: Theme.text;
+            font-size: 17px;
+            font-weight: 600;
+            overflow: elide;
+        }
+        if root.subtitle != "": Text {
+            text: root.subtitle;
+            color: Theme.text-2;
+            font-size: 12.5px;
+            overflow: elide;
+        }
+    }
+    @children
+    IconBtn {
+        icon: @image-url("icons/x.svg");
+        clicked => { root.close(); }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "DD-GUI";
+    icon: @image-url("logo.svg");
+    preferred-width: 920px;
+    preferred-height: 548px;
+    min-width: 820px;
+    min-height: 520px;
+    background: Theme.bg;
+    default-font-family: "Inter";
+    default-font-size: 13px;
+    forward-focus: keys;
+
+    in property <string> version;
+
+    // ---- setup ----
+    in-out property <int> source-mode;          // 0 file, 1 drive, 2 zeros
+    in property <bool> zeros-available: true;
+    in property <bool> source-set;
+    in property <int> source-glyph;
+    in property <string> source-title;
+    in property <string> source-subtitle;
+    in property <string> source-tag;
+    in-out property <int> target-mode;          // 0 drive, 1 file
+    in property <bool> target-set;
+    in property <int> target-glyph;
+    in property <string> target-title;
+    in property <string> target-subtitle;
+
+    in property <[Token]> command;
+    in property <string> command-text;
+    in property <bool> can-start;
+    in property <string> action-text: "Start";
+    in property <string> banner;
+    in property <bool> banner-warning;
+    in property <bool> starting;
+
+    // ---- advanced ----
+    in-out property <bool> advanced-open;
+    in-out property <int> block-size;           // 0 auto, then 512K, 1M, 4M, 16M, 64M
+    in-out property <bool> opt-noerror;
+    in-out property <string> count-text;
+    in-out property <string> skip-text;
+    in-out property <string> seek-text;
+    in property <string> auto-summary;
+    property <bool> customized: block-size != 0 || opt-noerror || count-text != "" || skip-text != "" || seek-text != "";
+
+    // ---- drive picker ----
+    in-out property <bool> picker-open;
+    in property <bool> picker-for-source;
+    in property <[DriveItem]> drives;
+    in property <bool> drives-loading;
+    in property <string> drives-error;
+    in-out property <bool> show-all-drives;
+
+    // ---- erase confirmation ----
+    in-out property <bool> confirm-open;
+    in property <string> confirm-title;
+    in property <string> confirm-body;
+    in property <string> confirm-detail;
+    in property <string> confirm-action;
+
+    // ---- copy mode (drive sources) ----
+    in property <bool> mode-open;
+    in property <bool> mode-loading;
+    in property <string> mode-status;
+    in property <string> mode-title;
+    in property <string> mode-subtitle;
+    in-out property <int> mode-choice;          // 0 smart, 1 sector by sector
+    in property <bool> smart-available: true;
+    in property <string> smart-figure;
+    in property <string> smart-body;
+    in property <string> smart-foot;
+    in property <string> full-figure;
+    in property <string> full-body;
+    in property <string> full-foot;
+    in property <string> mode-note;
+    in property <string> smart-output;
+    in property <string> full-output;
+    in property <string> mode-erase;
+    in property <string> mode-action;
+
+    // ---- progress and result ----
+    in property <int> page;                     // 0 setup, 1 job
+    in property <int> result;                   // 0 running, 1 done, 2 failed, 3 cancelled
+    in property <string> run-phase;
+    in property <bool> run-spinning;
+    in property <float> run-progress;
+    in property <string> run-percent;
+    in property <string> run-amount;
+    in property <string> run-route;
+    in property <[Token]> run-stats;
+    in property <[float]> run-bars;
+    in property <bool> run-cancelling;
+    in property <string> result-title;
+    in property <string> result-body;
+    in property <string> result-detail;
+    in property <bool> result-can-reveal;
+
+    in-out property <bool> about-open;
+
+    callback choose-source-file();
+    callback choose-target-file();
+    callback open-picker(bool);
+    callback pick-drive(string);
+    callback refresh-drives();
+    callback settings-changed();
+    callback start();
+    callback confirm();
+    callback mode-start();
+    callback mode-cancel();
+    callback cancel-job();
+    callback finish();
+    callback reveal();
+    callback open-repository();
+
+    init => {
+        // Some desktops don't report a preference; default to dark then.
+        if (Palette.color-scheme == ColorScheme.unknown) {
+            Palette.color-scheme = ColorScheme.dark;
+        }
+        keys.focus();
+    }
+
+    keys := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                if (root.advanced-open) {
+                    root.advanced-open = false;
+                    keys.focus();
+                    return accept;
+                }
+                if (root.mode-open) {
+                    root.mode-cancel();
+                    return accept;
+                }
+                if (root.confirm-open) {
+                    root.confirm-open = false;
+                    return accept;
+                }
+                if (root.picker-open) {
+                    root.picker-open = false;
+                    return accept;
+                }
+                if (root.about-open) {
+                    root.about-open = false;
+                    return accept;
+                }
+                if (root.advanced-open) {
+                    root.advanced-open = false;
+                    return accept;
+                }
+            }
+            if (event.text == Key.Return && root.page == 0 && root.can-start && !root.starting && !root.confirm-open && !root.picker-open && !root.advanced-open && !root.about-open && !root.mode-open) {
+                root.start();
+                return accept;
+            }
+            return reject;
+        }
+
+        // ================= setup page =================
+        VerticalLayout {
+            padding: 26px;
+            padding-top: 18px;
+            spacing: 16px;
+            opacity: root.page == 0 ? 1 : 0;
+            visible: self.opacity > 0.01;
+            animate opacity { duration: Theme.smooth; easing: ease-out; }
+
+            HorizontalLayout {
+                height: 40px;
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: @image-url("logo.svg");
+                        width: 30px;
+                        height: 30px;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                    Text {
+                        text: "DD-GUI";
+                        color: Theme.text;
+                        font-family: Theme.display;
+                        font-size: 16px;
+                        font-weight: 700;
+                        letter-spacing: 0.3px;
+                    }
+                    Text {
+                        text: "flash · back up · clone · wipe";
+                        color: Theme.text-3;
+                        font-family: Theme.mono;
+                        font-size: 10.5px;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                VerticalLayout {
+                    alignment: center;
+                    IconBtn {
+                        icon: Theme.dark ? @image-url("icons/sun.svg") : @image-url("icons/moon.svg");
+                        clicked => {
+                            Palette.color-scheme = Theme.dark ? ColorScheme.light : ColorScheme.dark;
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    IconBtn {
+                        icon: @image-url("icons/info.svg");
+                        clicked => { root.about-open = true; }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 12px;
+                vertical-stretch: 1;
+                min-height: 250px;
+                EndpointCard {
+                    horizontal-stretch: 1;
+                    preferred-width: 320px;
+                    heading: "FROM";
+                    modes: root.zeros-available ? ["File", "Drive", "Zeros"] : ["File", "Drive"];
+                    mode <=> root.source-mode;
+                    filled: root.source-set;
+                    glyph: root.source-glyph;
+                    title: root.source-title;
+                    subtitle: root.source-subtitle;
+                    tag: root.source-tag;
+                    clickable: root.source-mode != 2;
+                    mode-changed => { root.settings-changed(); }
+                    activate => {
+                        if (root.source-mode == 0) {
+                            root.choose-source-file();
+                        } else {
+                            root.open-picker(true);
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Connector { active: root.source-set && root.target-set; }
+                }
+                EndpointCard {
+                    horizontal-stretch: 1;
+                    preferred-width: 320px;
+                    heading: "TO";
+                    modes: ["Drive", "File"];
+                    mode <=> root.target-mode;
+                    filled: root.target-set;
+                    glyph: root.target-glyph;
+                    title: root.target-title;
+                    subtitle: root.target-subtitle;
+                    mode-changed => { root.settings-changed(); }
+                    activate => {
+                        if (root.target-mode == 0) {
+                            root.open-picker(false);
+                        } else {
+                            root.choose-target-file();
+                        }
+                    }
+                }
+            }
+
+            if root.banner != "": Banner {
+                text: root.banner;
+                warning: root.banner-warning;
+            }
+
+            HorizontalLayout {
+                spacing: 12px;
+                CommandBar {
+                    horizontal-stretch: 1;
+                    tokens: root.command;
+                    text: root.command-text;
+                    customized: root.customized;
+                    advanced => { root.advanced-open = true; }
+                }
+                Btn {
+                    width: 196px;
+                    tall: 48px;
+                    kind: "primary";
+                    text: root.starting ? "Starting…" : root.action-text;
+                    enabled: root.can-start && !root.starting;
+                    clicked => { root.start(); }
+                }
+            }
+        }
+
+        // ================= job page =================
+        VerticalLayout {
+            padding: 22px;
+            alignment: center;
+            opacity: root.page == 1 ? 1 : 0;
+            visible: self.opacity > 0.01;
+            animate opacity { duration: Theme.smooth; easing: ease-out; }
+
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    width: 580px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            height: 28px;
+                            border-radius: 14px;
+                            background: root.result == 1 ? Theme.success-soft : root.result == 2 ? Theme.danger-soft : root.result == 3 ? Theme.raised : Theme.accent-soft;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 14px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 7px;
+                                        height: 7px;
+                                        border-radius: 3.5px;
+                                        background: root.result == 1 ? Theme.success : root.result == 2 ? Theme.danger : root.result == 3 ? Theme.text-3 : Theme.accent;
+                                        opacity: root.result == 0 && root.page == 1 ? 0.45 + 0.55 * Math.abs(Math.sin(animation-tick() / 1ms * 0.18deg)) : 1;
+                                    }
+                                }
+                                Text {
+                                    text: root.result == 0 ? root.run-phase : root.result-title;
+                                    color: root.result == 1 ? Theme.success : root.result == 2 ? Theme.danger : root.result == 3 ? Theme.text-2 : Theme.accent;
+                                    font-size: 12.5px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 200px;
+                            height: 200px;
+                            ProgressRing {
+                                width: 100%;
+                                height: 100%;
+                                progress: root.run-progress;
+                                spinning: root.run-spinning && root.result == 0;
+                                opacity: root.result == 0 ? 1 : 0;
+                                animate opacity { duration: Theme.smooth; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 4px;
+                                opacity: root.result == 0 ? 1 : 0;
+                                animate opacity { duration: Theme.smooth; }
+                                Text {
+                                    text: root.run-percent;
+                                    color: Theme.text;
+                                    font-family: Theme.display;
+                                    font-size: 48px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: root.run-amount;
+                                    color: Theme.text-2;
+                                    font-size: 12.5px;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                            Rectangle {
+                                x: 34px;
+                                y: 34px;
+                                width: 132px;
+                                height: 132px;
+                                border-radius: 66px;
+                                background: root.result == 1 ? Theme.success-soft : root.result == 2 ? Theme.danger-soft : Theme.raised;
+                                opacity: root.result == 0 ? 0 : 1;
+                                animate opacity { duration: 320ms; easing: ease-out; }
+                                Image {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    width: root.result == 0 ? 36px : 56px;
+                                    height: self.width;
+                                    animate width { duration: 400ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }
+                                    source: root.result == 1 ? @image-url("icons/check.svg") : root.result == 2 ? @image-url("icons/x.svg") : @image-url("icons/ban.svg");
+                                    colorize: root.result == 1 ? Theme.success : root.result == 2 ? Theme.danger : Theme.text-2;
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: root.result == 0 || root.result == 1 ? root.run-route : root.result-body;
+                        color: Theme.text-2;
+                        font-size: 13.5px;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        for stat in root.run-stats: Stat {
+                            horizontal-stretch: 1;
+                            preferred-width: 160px;
+                            label: stat.key;
+                            value: stat.value;
+                        }
+                    }
+
+                    if root.result != 2 && root.run-bars.length > 0: Bars {
+                        height: 44px;
+                        values: root.run-bars;
+                    }
+
+                    if root.result == 2 && root.result-detail != "": Rectangle {
+                        border-radius: 10px;
+                        background: Theme.code;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 14px;
+                            Text {
+                                text: root.result-detail;
+                                color: Theme.text-2;
+                                font-family: Theme.mono;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 10px;
+                        padding-top: 4px;
+                        if root.result == 0: Btn {
+                            width: 150px;
+                            text: root.run-cancelling ? "Cancelling…" : "Cancel";
+                            enabled: !root.run-cancelling;
+                            clicked => { root.cancel-job(); }
+                        }
+                        if root.result != 0 && root.result-can-reveal: Btn {
+                            text: "Show file";
+                            has-icon: true;
+                            icon: @image-url("icons/folder-open.svg");
+                            clicked => { root.reveal(); }
+                        }
+                        if root.result != 0: Btn {
+                            width: 150px;
+                            kind: "primary";
+                            text: root.result == 1 ? "Done" : "Back";
+                            clicked => { root.finish(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= copy mode =================
+        Modal {
+            open: root.mode-open;
+            panel-width: 620px;
+            dismiss => { root.mode-cancel(); }
+            VerticalLayout {
+                padding: 24px;
+                spacing: 18px;
+                DialogHeader {
+                    title: root.mode-title;
+                    subtitle: root.mode-subtitle;
+                    close => { root.mode-cancel(); }
+                }
+                if root.mode-loading: HorizontalLayout {
+                    height: 170px;
+                    alignment: center;
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: center;
+                        Spinner { }
+                    }
+                    Text {
+                        text: root.mode-status;
+                        color: Theme.text-2;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                }
+                if !root.mode-loading: HorizontalLayout {
+                    spacing: 12px;
+                    ChoiceCard {
+                        horizontal-stretch: 1;
+                        preferred-width: 200px;
+                        enabled: root.smart-available;
+                        selected: root.mode-choice == 0;
+                        title: "Smart copy";
+                        tag: "RECOMMENDED";
+                        figure: root.smart-figure;
+                        figure-caption: "to copy";
+                        body: root.smart-body;
+                        foot: root.smart-foot;
+                        picked => { root.mode-choice = 0; }
+                    }
+                    ChoiceCard {
+                        horizontal-stretch: 1;
+                        preferred-width: 200px;
+                        selected: root.mode-choice == 1;
+                        title: "Sector by sector";
+                        figure: root.full-figure;
+                        figure-caption: "to copy";
+                        body: root.full-body;
+                        foot: root.full-foot;
+                        picked => { root.mode-choice = 1; }
+                    }
+                }
+                if !root.mode-loading && root.mode-note != "": Text {
+                    text: root.mode-note;
+                    color: Theme.text-3;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                if !root.mode-loading && root.smart-output != "": HorizontalLayout {
+                    spacing: 10px;
+                    Caption {
+                        text: "SAVES AS";
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.mode-choice == 0 ? root.smart-output : root.full-output;
+                        color: Theme.text-2;
+                        font-family: Theme.mono;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                if !root.mode-loading && root.mode-erase != "": Rectangle {
+                    height: 40px;
+                    border-radius: 10px;
+                    background: Theme.danger-soft;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            Image {
+                                width: 16px;
+                                height: 16px;
+                                source: @image-url("icons/triangle-alert.svg");
+                                colorize: Theme.danger;
+                            }
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: root.mode-erase;
+                            color: Theme.text;
+                            font-size: 12.5px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: LayoutAlignment.end;
+                    spacing: 10px;
+                    Btn {
+                        width: 110px;
+                        text: "Cancel";
+                        clicked => { root.mode-cancel(); }
+                    }
+                    Btn {
+                        kind: root.mode-erase != "" ? "danger" : "primary";
+                        text: root.mode-action;
+                        enabled: !root.mode-loading;
+                        clicked => { root.mode-start(); }
+                    }
+                }
+            }
+        }
+
+        // ================= advanced =================
+        Modal {
+            open: root.advanced-open;
+            panel-width: 480px;
+            dismiss => {
+                root.advanced-open = false;
+                keys.focus();
+            }
+            VerticalLayout {
+                padding: 24px;
+                spacing: 20px;
+                DialogHeader {
+                    title: "Advanced";
+                    subtitle: "DD-GUI tunes dd for each job. Override it here if you need to.";
+                    close => {
+                        root.advanced-open = false;
+                        keys.focus();
+                    }
+                }
+                VerticalLayout {
+                    spacing: 8px;
+                    Caption { text: "BLOCK SIZE"; }
+                    Segmented {
+                        options: ["Auto", "512K", "1M", "4M", "16M", "64M"];
+                        item-width: 69px;
+                        item-height: 30px;
+                        selected <=> root.block-size;
+                        changed => { root.settings-changed(); }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Field {
+                            horizontal-stretch: 1;
+                            label: "COUNT";
+                            placeholder: "all";
+                            suffix: "blocks";
+                            text <=> root.count-text;
+                            edited => { root.settings-changed(); }
+                        }
+                        Field {
+                            horizontal-stretch: 1;
+                            label: "SKIP";
+                            placeholder: "0";
+                            suffix: "blocks";
+                            text <=> root.skip-text;
+                            edited => { root.settings-changed(); }
+                        }
+                        Field {
+                            horizontal-stretch: 1;
+                            label: "SEEK";
+                            placeholder: "0";
+                            suffix: "blocks";
+                            text <=> root.seek-text;
+                            edited => { root.settings-changed(); }
+                        }
+                    }
+                    Text {
+                        text: "Count limits how much is copied. Skip starts later in the source, seek starts later in the target.";
+                        color: Theme.text-3;
+                        font-size: 11.5px;
+                        wrap: word-wrap;
+                    }
+                }
+                Toggle {
+                    text: "Keep going on read errors";
+                    hint: "conv=noerror,sync — for rescuing failing drives";
+                    checked <=> root.opt-noerror;
+                    toggled => { root.settings-changed(); }
+                }
+                VerticalLayout {
+                    spacing: 6px;
+                    Caption { text: "CHOSEN AUTOMATICALLY"; }
+                    Text {
+                        text: root.auto-summary;
+                        color: Theme.text-2;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                }
+                HorizontalLayout {
+                    alignment: LayoutAlignment.end;
+                    spacing: 10px;
+                    Btn {
+                        kind: "ghost";
+                        text: "Reset";
+                        clicked => {
+                            root.block-size = 0;
+                            root.count-text = "";
+                            root.skip-text = "";
+                            root.seek-text = "";
+                            root.opt-noerror = false;
+                            root.settings-changed();
+                        }
+                    }
+                    Btn {
+                        width: 100px;
+                        kind: "primary";
+                        text: "Done";
+                        clicked => {
+                            root.advanced-open = false;
+                            keys.focus();
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= drive picker =================
+        Modal {
+            open: root.picker-open;
+            panel-width: 540px;
+            dismiss => { root.picker-open = false; }
+            VerticalLayout {
+                padding: 22px;
+                spacing: 16px;
+                DialogHeader {
+                    title: root.picker-for-source ? "Read from a drive" : "Write to a drive";
+                    subtitle: root.picker-for-source ? "You'll choose how to copy it next." : "Everything on the drive you pick will be replaced.";
+                    close => { root.picker-open = false; }
+                    VerticalLayout {
+                        alignment: center;
+                        IconBtn {
+                            icon: @image-url("icons/refresh-cw.svg");
+                            icon-size: 16px;
+                            clicked => { root.refresh-drives(); }
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 292px;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    if root.drives.length > 0: ListView {
+                        width: 100%;
+                        height: 100%;
+                        for drive in root.drives: Rectangle {
+                            height: 68px;
+                            DriveRow {
+                                x: 4px;
+                                y: 2px;
+                                width: parent.width - 8px;
+                                item: drive;
+                                picked(key) => { root.pick-drive(key); }
+                            }
+                        }
+                    }
+                    if root.drives.length == 0: VerticalLayout {
+                        alignment: center;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            alignment: center;
+                            Image {
+                                width: 30px;
+                                height: 30px;
+                                source: @image-url("icons/usb.svg");
+                                colorize: Theme.text-3;
+                            }
+                        }
+                        Text {
+                            text: root.drives-error != "" ? "Couldn't list drives" : root.drives-loading ? "Looking for drives…" : root.show-all-drives ? "No drives found" : "No removable drives found";
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: root.drives-error != "" ? root.drives-error : "Plug in a USB drive or SD card. It'll show up here.";
+                            color: Theme.text-3;
+                            font-size: 12.5px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                Toggle {
+                    text: "Show internal drives";
+                    checked <=> root.show-all-drives;
+                    toggled => { root.refresh-drives(); }
+                }
+            }
+        }
+
+        // ================= erase confirmation =================
+        Modal {
+            open: root.confirm-open;
+            panel-width: 450px;
+            dismiss => { root.confirm-open = false; }
+            VerticalLayout {
+                padding: 26px;
+                spacing: 18px;
+                HorizontalLayout {
+                    alignment: LayoutAlignment.start;
+                    Rectangle {
+                        width: 48px;
+                        height: 48px;
+                        border-radius: 12px;
+                        background: Theme.danger-soft;
+                        Image {
+                            x: 12px;
+                            y: 12px;
+                            width: 24px;
+                            height: 24px;
+                            source: @image-url("icons/triangle-alert.svg");
+                            colorize: Theme.danger;
+                        }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.confirm-title;
+                        color: Theme.text;
+                        font-size: 19px;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: root.confirm-body;
+                        color: Theme.text-2;
+                        font-size: 13.5px;
+                        wrap: word-wrap;
+                    }
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    background: Theme.raised;
+                    VerticalLayout {
+                        padding: 13px;
+                        Text {
+                            text: root.confirm-detail;
+                            color: Theme.text-2;
+                            font-family: Theme.mono;
+                            font-size: 11.5px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: LayoutAlignment.end;
+                    spacing: 10px;
+                    Btn {
+                        width: 110px;
+                        text: "Cancel";
+                        clicked => { root.confirm-open = false; }
+                    }
+                    Btn {
+                        kind: "danger";
+                        text: root.confirm-action;
+                        clicked => {
+                            root.confirm-open = false;
+                            root.confirm();
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= about =================
+        Modal {
+            open: root.about-open;
+            panel-width: 440px;
+            dismiss => { root.about-open = false; }
+            VerticalLayout {
+                padding: 26px;
+                spacing: 16px;
+                HorizontalLayout {
+                    spacing: 14px;
+                    Image {
+                        source: @image-url("logo.svg");
+                        width: 48px;
+                        height: 48px;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "DD-GUI";
+                            color: Theme.text;
+                            font-family: Theme.display;
+                            font-size: 19px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "Version " + root.version + " · by Sir-MmD";
+                            color: Theme.text-3;
+                            font-family: Theme.mono;
+                            font-size: 11.5px;
+                        }
+                        link := Text {
+                            text: "github.com/Sir-MmD/dd-gui";
+                            color: link-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                            font-family: Theme.mono;
+                            font-size: 11.5px;
+                            link-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-repository(); }
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: "A friendly face for dd. Sector-by-sector copies are done by dd from uutils coreutils, built right into this app. Smart copies read the file system's map and copy only the space in use.";
+                    color: Theme.text-2;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Includes uutils coreutils (MIT), Inter and JetBrains Mono (SIL Open Font License) and Lucide icons (ISC).";
+                    color: Theme.text-3;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                AboutSlint {
+                    height: 110px;
+                }
+                HorizontalLayout {
+                    alignment: LayoutAlignment.end;
+                    Btn {
+                        width: 100px;
+                        text: "Close";
+                        clicked => { root.about-open = false; }
+                    }
+                }
+            }
+        }
+    }
+}

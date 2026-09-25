@@ -1,0 +1,56 @@
+import { Palette } from "std-widgets.slint";
+
+import "fonts/Inter-Regular.ttf";
+import "fonts/Inter-Medium.ttf";
+import "fonts/Inter-SemiBold.ttf";
+import "fonts/Inter-Bold.ttf";
+import "fonts/InterDisplay-SemiBold.ttf";
+import "fonts/InterDisplay-Bold.ttf";
+import "fonts/JetBrainsMono-Regular.ttf";
+import "fonts/JetBrainsMono-Medium.ttf";
+
+// Graphite neutrals and one signal-orange accent. Solid colors only.
+export global Theme {
+    // Follows the std-widgets palette, so scrollbars and the like match.
+    out property <bool> dark: Palette.color-scheme != ColorScheme.light;
+
+    out property <color> bg: dark ? #0f0f10 : #f5f5f3;
+    out property <color> surface: dark ? #161618 : #ffffff;
+    out property <color> surface-hover: dark ? #1b1b1e : #fbfbfa;
+    out property <color> raised: dark ? #202024 : #efefec;
+    out property <color> raised-hover: dark ? #29292e : #e6e6e2;
+    out property <color> thumb: dark ? #34343b : #ffffff;
+    out property <color> code: dark ? #121214 : #fafaf8;
+    out property <color> border: dark ? #26262b : #e2e2de;
+    out property <color> border-strong: dark ? #37373e : #cfcfc9;
+    out property <color> backdrop: dark ? #000000a6 : #1a1a1a59;
+    out property <color> shadow: dark ? #00000080 : #1a1a1a26;
+
+    out property <color> text: dark ? #f2f2f3 : #111113;
+    out property <color> text-2: dark ? #a5a5ad : #55555d;
+    out property <color> text-3: dark ? #6e6e77 : #8b8b93;
+
+    out property <color> accent: dark ? #ff7a1a : #f46a0e;
+    out property <color> accent-hover: dark ? #ff8d3a : #ff7a1a;
+    out property <color> accent-press: dark ? #e86a0c : #d95b08;
+    out property <color> accent-soft: dark ? #ff7a1a1f : #f46a0e1a;
+    out property <color> accent-line: dark ? #ff7a1a66 : #f46a0e73;
+    out property <color> on-accent: #140a02;
+
+    out property <color> danger: dark ? #e5484d : #d93d42;
+    out property <color> danger-hover: dark ? #ec5d61 : #e5484d;
+    out property <color> danger-soft: dark ? #e5484d21 : #d93d421a;
+    out property <color> warning: dark ? #f5c542 : #9a7000;
+    out property <color> warning-soft: dark ? #f5c5421c : #f5c54236;
+    out property <color> success: dark ? #3dcb7f : #1e9e5a;
+    out property <color> success-soft: dark ? #3dcb7f1f : #1e9e5a1a;
+
+    out property <string> mono: "JetBrains Mono";
+    out property <string> display: "Inter Display";
+
+    out property <length> radius: 14px;
+    out property <length> radius-sm: 10px;
+
+    out property <duration> quick: 120ms;
+    out property <duration> smooth: 240ms;
+}
