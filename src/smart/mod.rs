@@ -25,6 +25,10 @@ mod probe;
 mod swap;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_apple;
+#[cfg(test)]
+mod tests_linux;
 mod udf;
 mod util;
 mod xfs;
