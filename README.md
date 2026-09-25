@@ -6,9 +6,16 @@ A simple, good-looking front end for `dd`, shipped as one self-contained file fo
 Windows and macOS. Flash an image to a USB stick, back up a drive, clone one drive to
 another, or wipe one, and see exactly which `dd` command runs.
 
-![Choosing an image and a drive](docs/setup.png)
-![Choosing how to copy a drive](docs/copy-mode.png)
-![Copying](docs/progress.png)
+<table>
+  <tr>
+    <td><img src="docs/setup.png" alt="Choosing an image and a drive"></td>
+    <td><img src="docs/copy-mode.png" alt="Choosing how to copy a drive: smart copy or sector by sector"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/progress.png" alt="Copying, with speed and time left"></td>
+    <td><img src="docs/done.png" alt="A smart backup finished: 272 MB copied into an 85.6 MB image"></td>
+  </tr>
+</table>
 
 ## What it does
 
@@ -40,6 +47,25 @@ another, or wipe one, and see exactly which `dd` command runs.
   - Drives are unmounted (on Windows, locked) while they're copied, and mounted again afterwards.
 - **One file.** `dd` from [uutils coreutils](https://github.com/uutils/coreutils) (MIT,
   GNU-compatible) is compiled in: `dd-gui dd if=… of=…` works like `dd` from a terminal.
+
+## Run
+
+There are no downloads yet: build DD-GUI with the script for your OS (see [Build](#build)).
+Then:
+
+- **Linux:** run `dd-gui`, or `dd-gui some-image.iso` to start with that image chosen. It asks
+  for your password (polkit) only when a drive is involved. On first start it adds its icon
+  and a menu entry to `~/.local/share`; set `DD_GUI_NO_DESKTOP_INTEGRATION=1` to skip that.
+- **macOS:** open `DD-GUI.app`. The system password prompt appears when a drive is involved.
+- **Windows:** run `dd-gui.exe`. It asks for administrator rights when it starts.
+
+The same file also works from a terminal:
+
+| Command | Does |
+|---|---|
+| `dd-gui dd if=… of=…` | the bundled `dd`, like the real one |
+| `dd-gui drives` | lists the drives as JSON |
+| `dd-gui copy …` | the copier behind smart copies and image unpacking |
 
 ## Smart copy
 
@@ -127,15 +153,12 @@ like pacman's.
   a zip downloaded in a browser. Right-click it and choose Open, or run it from Terminal.
   A `git clone` doesn't have this problem.
 - **Building by hand:** `cargo build --release` works too, once the dependencies are there.
-- **Running it:**
-  - Linux: the binary only needs libc, fontconfig and freetype. X11, Wayland and OpenGL
-    are loaded at runtime if they're present, and a software renderer is built in. On start,
-    it copies its icons and a menu entry into `~/.local/share`, so menus, docks and the
-    Wayland taskbar show it with its icon. Set `DD_GUI_NO_DESKTOP_INTEGRATION=1` to turn
-    that off.
-  - Windows: `dd-gui.exe` carries its icon, version info and an administrator manifest.
-    You can also cross-build it from Linux with mingw-w64:
-    `cargo build --release --target x86_64-pc-windows-gnu`.
+  `dd-gui.exe` can also be cross-built from Linux with mingw-w64:
+  `cargo build --release --target x86_64-pc-windows-gnu`.
+- **What the binary needs:**
+  - On Linux, only libc, fontconfig and freetype. X11, Wayland and OpenGL are loaded at
+    runtime if they're present, and a software renderer is built in.
+  - On Windows, `dd-gui.exe` carries its icon, version info and an administrator manifest.
 
 `.github/workflows/build.yml` builds and tests all three, and runs end-to-end tests with
 virtual disks (`ci/`). `packaging/README.md` covers the desktop entry, icons and app bundle.
@@ -159,6 +182,9 @@ dd-gui (window, runs as you)
 - **Windows:** the exe builds with its icon, version info and manifest. Its copier and dd paths
   pass under Wine. It hasn't run on a real Windows PC yet.
 - **macOS:** the code compiles, but it hasn't run on a real Mac yet.
+- **Build scripts:** `build.sh` is tested on Linux. `build.command` and `build.bat` were
+  checked with macOS's bash 3.2 and with PowerShell, using stand-ins for the macOS and
+  Windows tools, but haven't run on a real Mac or Windows PC yet.
 - **CI:** CI will run the Windows and macOS tests and the end-to-end scripts in `ci/` once
   GitHub Actions runs for the repository. So far it hasn't created any runs.
 
