@@ -435,7 +435,9 @@ component DialogHeader inherits HorizontalLayout {
 
 export component AppWindow inherits Window {
     title: "DD-GUI";
-    icon: @image-url("logo.svg");
+    // The full app icon, as on the exe and in the desktop entry (logo.svg is the small in-app
+    // mark). Slint renders it at 64 px for the window manager; a PNG here ends up empty on X11.
+    icon: @image-url("../assets/icon.svg");
     preferred-width: 920px;
     preferred-height: 548px;
     min-width: 820px;
@@ -1326,7 +1328,7 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                 }
                 Text {
-                    text: "Includes uutils coreutils (MIT), Inter and JetBrains Mono (SIL Open Font License) and Lucide icons (ISC).";
+                    text: "Includes uutils coreutils (MIT), Zstandard (BSD), Inter and JetBrains Mono (SIL Open Font License), Lucide icons (ISC) and other open-source Rust crates.";
                     color: Theme.text-3;
                     font-size: 12px;
                     wrap: word-wrap;

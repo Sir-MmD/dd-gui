@@ -1,4 +1,11 @@
 //! Raw I/O on drives and image files: aligned buffers, direct I/O, whole sectors.
+//!
+//! Drives are opened unbuffered wherever the OS allows it (O_DIRECT on Linux, the raw
+//! /dev/rdiskN on macOS, FILE_FLAG_NO_BUFFERING and FILE_FLAG_WRITE_THROUGH on Windows),
+//! so the progress follows the drive rather than a cache in RAM. Such drives only take
+//! whole sectors at sector offsets, from aligned memory. `Disk` turns every read and
+//! write into that: reads fetch the whole sectors around what was asked for, and a
+//! write that covers part of a sector reads that sector, patches it and writes it back.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -65,20 +72,23 @@ pub struct Disk {
     /// The drive's size, or the file's length when it was opened.
     pub size: u64,
     pub is_drive: bool,
-    /// Set when transfers have to be whole sectors at sector offsets: direct I/O on
-    /// Linux, raw devices on macOS and Windows.
-    sector: Option<u64>,
+    /// Transfers have to be whole sectors of this many bytes, at sector offsets and
+    /// from aligned memory (direct I/O, raw devices). 1 when anything goes.
+    sector: u64,
+    /// Tests: fail transfers that such a drive would refuse.
+    #[cfg(test)]
+    strict: bool,
 }
 
 impl Disk {
     /// Opens a drive or an image file for reading.
     pub fn open_read(path: &Path) -> io::Result<Disk> {
-        Self::open(path, OpenOptions::new().read(true))
+        Self::open(path, false)
     }
 
     /// Opens a drive for writing. Never creates or truncates anything.
     pub fn open_drive(path: &Path) -> io::Result<Disk> {
-        Self::open(path, OpenOptions::new().read(true).write(true))
+        Self::open(path, true)
     }
 
     /// Creates an image file, or empties an existing one.
@@ -89,76 +99,108 @@ impl Disk {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(Disk {
-            file,
-            path: path.into(),
-            size: 0,
-            is_drive: false,
-            sector: None,
-        })
+        Ok(Self::new(file, path, 0, false, 1))
     }
 
-    fn open(path: &Path, opts: &OpenOptions) -> io::Result<Disk> {
-        if !is_drive(path) {
-            let file = opts.open(path)?;
-            let size = file.metadata()?.len();
-            return Ok(Disk {
-                file,
-                path: path.into(),
-                size,
-                is_drive: false,
-                sector: None,
-            });
-        }
-        let (file, size, sector) = platform::open_drive(path, opts)?;
-        Ok(Disk {
+    fn new(file: File, path: &Path, size: u64, is_drive: bool, sector: u64) -> Disk {
+        Disk {
             file,
             path: path.into(),
             size,
-            is_drive: true,
+            is_drive,
             sector,
-        })
+            #[cfg(test)]
+            strict: false,
+        }
+    }
+
+    fn open(path: &Path, write: bool) -> io::Result<Disk> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(write);
+        if !is_drive(path) {
+            let file = opts.open(path)?;
+            let size = file.metadata()?.len();
+            return Ok(Self::new(file, path, size, false, 1));
+        }
+        let (file, size, sector) = platform::open_drive(path, &opts, write)?;
+        Ok(Self::new(file, path, size, true, sector.max(1)))
+    }
+
+    /// Tests: a file that acts like a drive whose sectors hold `sector` bytes, and which
+    /// refuses anything but whole sectors from aligned memory (as O_DIRECT does).
+    #[cfg(all(test, unix))]
+    pub fn strict(path: &Path, sector: u64) -> io::Result<Disk> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file.metadata()?.len();
+        let mut disk = Self::new(file, path, size, true, sector);
+        disk.strict = true;
+        Ok(disk)
+    }
+
+    /// The boundary that reads and writes are best aligned to: a sector, and at least 4 KiB.
+    pub fn align(&self) -> u64 {
+        self.sector.max(ALIGN as u64)
     }
 
     /// Reads `len` bytes at `off` into the start of `buf`.
     pub fn read_at(&self, off: u64, buf: &mut AlignedBuf, len: usize) -> io::Result<()> {
-        let Some(sector) = self.sector else {
-            return read_exact_at(&self.file, &mut buf[..len], off);
-        };
-        if !off.is_multiple_of(sector) {
-            // Rare: read the whole sectors around it.
-            let start = off - off % sector;
-            let span = (round_up(off + len as u64, sector) - start) as usize;
-            let mut whole = AlignedBuf::new(span);
-            self.read_at(start, &mut whole, span)?;
-            let at = (off - start) as usize;
-            buf[..len].copy_from_slice(&whole[at..at + len]);
-            return Ok(());
+        let s = self.sector;
+        if off.is_multiple_of(s) && (len as u64).is_multiple_of(s) {
+            return self.pread(&mut buf[..len], off);
         }
-        // Whole sectors, but never past the end of the drive (or of `buf`).
-        let want = round_up(len as u64, sector)
-            .min(self.size.saturating_sub(off))
-            .min(buf.len() as u64)
-            .max(len as u64);
-        read_exact_at(&self.file, &mut buf[..want as usize], off)
+        // Whole sectors straight into `buf`, as far as it has room for them.
+        let mut body = 0;
+        if off.is_multiple_of(s) {
+            let whole = round_up(len as u64, s) as usize;
+            if whole <= buf.len() {
+                return self.pread(&mut buf[..whole], off);
+            }
+            body = len - len % s as usize;
+            self.pread(&mut buf[..body], off)?;
+        }
+        // The rest (a partial last sector, or everything when `off` is inside a sector):
+        // the sectors around it, through a buffer of their own.
+        let from = off + body as u64;
+        let rest = len - body;
+        let start = from - from % s;
+        let mut whole = AlignedBuf::new((round_up(from + rest as u64, s) - start) as usize);
+        self.pread(&mut whole, start)?;
+        let at = (from - start) as usize;
+        buf[body..len].copy_from_slice(&whole[at..at + rest]);
+        Ok(())
     }
 
     /// Writes `data`, which starts on an aligned address (in an `AlignedBuf`), at `off`.
     pub fn write_at(&self, off: u64, data: &[u8]) -> io::Result<()> {
+        let s = self.sector;
         let len = data.len() as u64;
-        match self.sector {
-            Some(sector) if !off.is_multiple_of(sector) || !len.is_multiple_of(sector) => {
-                // A partial sector: normally just the very end of an image.
-                let body = if off.is_multiple_of(sector) {
-                    (len - len % sector) as usize
-                } else {
-                    0
-                };
-                write_all_at(&self.file, &data[..body], off)?;
-                platform::write_partial(&self.file, off + body as u64, &data[body..], sector)
-            }
-            _ => write_all_at(&self.file, data, off),
+        if off.is_multiple_of(s) && len.is_multiple_of(s) {
+            return self.pwrite(data, off);
         }
+        // Whole sectors go straight to the drive (rare: normally only the very end of an
+        // image is a partial sector).
+        let mut body = 0;
+        if off.is_multiple_of(s) {
+            body = (len - len % s) as usize;
+            self.pwrite(&data[..body], off)?;
+        }
+        // Partial sectors: read what they hold, patch in the new bytes, write them back.
+        let from = off + body as u64;
+        let rest = &data[body..];
+        let start = from - from % s;
+        let span = (round_up(from + rest.len() as u64, s) - start) as usize;
+        let s = s as usize;
+        let mut whole = AlignedBuf::new(span);
+        let head = (from - start) as usize;
+        let end = head + rest.len();
+        if head > 0 || (end % s != 0 && span == s) {
+            self.pread(&mut whole[..s], start)?;
+        }
+        if end % s != 0 && span > s {
+            self.pread(&mut whole[span - s..], start + (span - s) as u64)?;
+        }
+        whole[head..end].copy_from_slice(rest);
+        self.pwrite(&whole, start)
     }
 
     /// Flushes everything written to the hardware.
@@ -174,6 +216,41 @@ impl Disk {
     /// For sequential writes to an image file.
     pub fn file(&self) -> &File {
         &self.file
+    }
+
+    fn pread(&self, buf: &mut [u8], off: u64) -> io::Result<()> {
+        self.check(off, buf)?;
+        read_exact_at(&self.file, buf, off)
+    }
+
+    fn pwrite(&self, data: &[u8], off: u64) -> io::Result<()> {
+        self.check(off, data)?;
+        write_all_at(&self.file, data, off)
+    }
+
+    /// Tests: what a strict drive refuses (EINVAL, as Linux says for misaligned O_DIRECT).
+    #[cfg(test)]
+    fn check(&self, off: u64, buf: &[u8]) -> io::Result<()> {
+        let s = self.sector;
+        let aligned = off.is_multiple_of(s)
+            && (buf.len() as u64).is_multiple_of(s)
+            && (buf.as_ptr() as u64).is_multiple_of(s.min(ALIGN as u64));
+        if self.strict && !aligned {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "misaligned transfer: {} bytes at {off} from {:p} (sectors of {s} bytes)",
+                    buf.len(),
+                    buf.as_ptr()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn check(&self, _off: u64, _buf: &[u8]) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -212,7 +289,9 @@ fn write_all_at(file: &File, mut data: &[u8], mut off: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// `Read + Seek` over a disk, for the analysis, which reads small pieces anywhere.
+/// `Read + Seek` over a disk, for the analysis, which reads small pieces anywhere. It
+/// only ever asks the disk for whole, aligned blocks (64 KiB to 1 MiB of them) and
+/// serves the small reads from those.
 pub struct DiskReader<'a> {
     disk: &'a Disk,
     pos: u64,
@@ -227,7 +306,7 @@ impl<'a> DiskReader<'a> {
         Self {
             disk,
             pos: 0,
-            buf: AlignedBuf::new(1 << 20),
+            buf: AlignedBuf::new(round_up(1 << 20, disk.align()) as usize),
             start: 0,
             filled: 0,
         }
@@ -241,9 +320,11 @@ impl Read for DiskReader<'_> {
             return Ok(0);
         }
         if !(self.start..self.start + self.filled as u64).contains(&self.pos) {
-            let start = self.pos - self.pos % ALIGN as u64;
-            // Small reads fetch 64 KiB around them, big ones up to 1 MiB at a time.
-            let want = round_up(self.pos + out.len() as u64 - start, ALIGN as u64)
+            let align = self.disk.align();
+            let start = self.pos - self.pos % align;
+            // Small reads fetch 64 KiB around them, big ones up to 1 MiB at a time. Only
+            // the end of the drive may cut that short (drives end on a whole sector).
+            let want = round_up(self.pos + out.len() as u64 - start, align)
                 .clamp(64 << 10, self.buf.len() as u64)
                 .min(size - start) as usize;
             self.filled = 0;
@@ -277,6 +358,25 @@ mod platform {
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
 
+    /// `_IOR(0x12, 114, size_t)` from <linux/fs.h>, which the libc crate lacks.
+    const BLKGETSIZE64: u64 = {
+        let read: u64 = if cfg!(any(
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        )) {
+            2 << 29
+        } else {
+            2 << 30
+        };
+        read | (size_of::<usize>() as u64) << 16 | 0x12 << 8 | 114
+    };
+
     pub fn pread(file: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
         file.read_at(buf, off)
     }
@@ -286,33 +386,36 @@ mod platform {
     }
 
     /// Opens with O_DIRECT (so progress tracks the drive, not the page cache), or
-    /// without it where that isn't supported.
-    pub fn open_drive(path: &Path, opts: &OpenOptions) -> io::Result<(File, u64, Option<u64>)> {
+    /// without it where that isn't supported. O_DIRECT takes whole logical sectors.
+    pub fn open_drive(
+        path: &Path,
+        opts: &OpenOptions,
+        _write: bool,
+    ) -> io::Result<(File, u64, u64)> {
         let (mut file, direct) = match opts.clone().custom_flags(libc::O_DIRECT).open(path) {
             Ok(file) => (file, true),
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => (opts.open(path)?, false),
             Err(e) => return Err(e),
         };
-        let size = file.seek(SeekFrom::End(0))?;
+        let fd = file.as_raw_fd();
+        let mut bytes: u64 = 0;
+        // SAFETY: BLKGETSIZE64 writes one u64.
+        let size = if unsafe { libc::ioctl(fd, BLKGETSIZE64 as _, &mut bytes) } == 0 {
+            bytes
+        } else {
+            // Not a block device (a character device, say).
+            file.seek(SeekFrom::End(0))?
+        };
         let mut sector: libc::c_int = 0;
         // SAFETY: BLKSSZGET writes one int.
-        let ok = unsafe { libc::ioctl(file.as_raw_fd(), libc::BLKSSZGET, &mut sector) } == 0;
-        let sector = if ok && sector > 0 { sector as u64 } else { 512 };
-        Ok((file, size, direct.then_some(sector)))
-    }
-
-    /// Like dd: the tail goes through the page cache, which fills in the rest of its sector.
-    pub fn write_partial(file: &File, off: u64, data: &[u8], _sector: u64) -> io::Result<()> {
-        let fd = file.as_raw_fd();
-        // SAFETY: fcntl on our own descriptor.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_DIRECT) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let result = write_all_at(file, data, off);
-        // SAFETY: as above.
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-        result
+        let known =
+            unsafe { libc::ioctl(fd, libc::BLKSSZGET as _, &mut sector) } == 0 && sector > 0;
+        let sector = match (direct, known) {
+            (false, _) => 1,
+            (true, true) => sector as u64,
+            (true, false) => 512,
+        };
+        Ok((file, size, sector))
     }
 }
 
@@ -334,35 +437,47 @@ mod platform {
         file.write_at(data, off)
     }
 
-    /// Raw devices (/dev/rdiskN) only take whole blocks, and can't seek to their end.
-    pub fn open_drive(path: &Path, opts: &OpenOptions) -> io::Result<(File, u64, Option<u64>)> {
+    /// Raw devices (/dev/rdiskN) only take whole blocks, and can't seek to their end:
+    /// the size is the block count times the block size.
+    pub fn open_drive(
+        path: &Path,
+        opts: &OpenOptions,
+        _write: bool,
+    ) -> io::Result<(File, u64, u64)> {
         let file = opts.open(path)?;
+        let fd = file.as_raw_fd();
         let (mut block, mut count) = (0u32, 0u64);
         // SAFETY: these ioctls write one u32 and one u64.
-        let ok = unsafe {
-            libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKSIZE, &mut block) == 0
-                && libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKCOUNT, &mut count) == 0
-        };
-        if !ok || block == 0 {
+        if unsafe { libc::ioctl(fd, DKIOCGETBLOCKSIZE, &mut block) } != 0
+            || unsafe { libc::ioctl(fd, DKIOCGETBLOCKCOUNT, &mut count) } != 0
+        {
             return Err(io::Error::last_os_error());
         }
-        Ok((file, count * block as u64, Some(block as u64)))
-    }
-
-    pub fn write_partial(file: &File, off: u64, data: &[u8], sector: u64) -> io::Result<()> {
-        read_modify_write(file, off, data, sector)
+        if block == 0 {
+            return Err(io::Error::other(format!(
+                "{} reports sectors of 0 bytes",
+                path.display()
+            )));
+        }
+        // No caching for /dev/diskN either (the raw /dev/rdiskN never caches).
+        // SAFETY: fcntl on our own descriptor.
+        unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+        Ok((file, count * block as u64, block as u64))
     }
 }
 
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::os::windows::fs::FileExt;
+    use std::os::windows::fs::{FileExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH,
+    };
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::{
-        DISK_GEOMETRY, GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DRIVE_GEOMETRY,
-        IOCTL_DISK_GET_LENGTH_INFO,
+        DISK_GEOMETRY, DISK_GEOMETRY_EX, GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DRIVE_GEOMETRY,
+        IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO,
     };
 
     pub fn pread(file: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
@@ -373,45 +488,63 @@ mod platform {
         file.seek_write(data, off)
     }
 
-    fn ioctl<T: Default>(file: &File, code: u32) -> io::Result<T> {
-        let mut out = T::default();
+    /// Asks the driver for a `T`, into a buffer of `room` bytes (at least a `T`).
+    fn ioctl<T: Copy>(file: &File, code: u32, room: usize) -> io::Result<T> {
+        // u64s keep the buffer aligned for any of these structs.
+        let mut out = vec![0u64; room.max(size_of::<T>()).div_ceil(8)];
         let mut returned = 0u32;
-        // SAFETY: `out` is a plain struct of the size we pass.
+        // SAFETY: the buffer is as big as we say, and big enough for a T.
         let ok = unsafe {
             DeviceIoControl(
                 file.as_raw_handle() as _,
                 code,
                 std::ptr::null(),
                 0,
-                (&mut out as *mut T).cast(),
-                std::mem::size_of::<T>() as u32,
+                out.as_mut_ptr().cast(),
+                (out.len() * 8) as u32,
                 &mut returned,
                 std::ptr::null_mut(),
             )
         } != 0;
-        if ok {
-            Ok(out)
-        } else {
-            Err(io::Error::last_os_error())
+        if !ok {
+            return Err(io::Error::last_os_error());
         }
+        if (returned as usize) < size_of::<T>() {
+            return Err(io::Error::other(
+                "the drive's driver gave an incomplete answer",
+            ));
+        }
+        // SAFETY: the driver filled in a T at the start of the buffer.
+        Ok(unsafe { out.as_ptr().cast::<T>().read_unaligned() })
     }
 
-    /// `\\.\PhysicalDriveN`: whole sectors only. std opens it with OPEN_EXISTING and
-    /// shares it for reading and writing; the volumes on it are locked by the plumbing.
-    pub fn open_drive(path: &Path, opts: &OpenOptions) -> io::Result<(File, u64, Option<u64>)> {
-        let file = opts.open(path)?;
-        let length: GET_LENGTH_INFORMATION = ioctl(&file, IOCTL_DISK_GET_LENGTH_INFO)?;
-        let geometry: DISK_GEOMETRY = ioctl(&file, IOCTL_DISK_GET_DRIVE_GEOMETRY)?;
-        let sector = if geometry.BytesPerSector > 0 {
-            geometry.BytesPerSector as u64
-        } else {
-            512
-        };
-        Ok((file, length.Length as u64, Some(sector)))
+    /// The logical sector size, which unbuffered I/O has to use.
+    fn sector_size(file: &File) -> Option<u32> {
+        // The _EX answer carries partition and detection data after the geometry; room for it.
+        let size = ioctl::<DISK_GEOMETRY_EX>(file, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, 256)
+            .map(|g| g.Geometry.BytesPerSector)
+            .or_else(|_| {
+                ioctl::<DISK_GEOMETRY>(file, IOCTL_DISK_GET_DRIVE_GEOMETRY, 0)
+                    .map(|g| g.BytesPerSector)
+            })
+            .ok()?;
+        (size >= 512 && size.is_power_of_two()).then_some(size)
     }
 
-    pub fn write_partial(file: &File, off: u64, data: &[u8], sector: u64) -> io::Result<()> {
-        read_modify_write(file, off, data, sector)
+    /// `\\.\PhysicalDriveN`: whole sectors only. Opened unbuffered (writes straight
+    /// through too), so the progress is what reached the drive. std opens it with
+    /// OPEN_EXISTING and shares it for reading and writing; the volumes on it are locked
+    /// by the plumbing.
+    pub fn open_drive(
+        path: &Path,
+        opts: &OpenOptions,
+        write: bool,
+    ) -> io::Result<(File, u64, u64)> {
+        let flags = FILE_FLAG_NO_BUFFERING | if write { FILE_FLAG_WRITE_THROUGH } else { 0 };
+        let file = opts.clone().custom_flags(flags).open(path)?;
+        let length: GET_LENGTH_INFORMATION = ioctl(&file, IOCTL_DISK_GET_LENGTH_INFO, 0)?;
+        let sector = sector_size(&file).unwrap_or(512);
+        Ok((file, length.Length as u64, sector as u64))
     }
 }
 
@@ -428,26 +561,13 @@ mod platform {
         file.write_at(data, off)
     }
 
-    pub fn open_drive(path: &Path, opts: &OpenOptions) -> io::Result<(File, u64, Option<u64>)> {
+    pub fn open_drive(
+        path: &Path,
+        opts: &OpenOptions,
+        _write: bool,
+    ) -> io::Result<(File, u64, u64)> {
         let mut file = opts.open(path)?;
         let size = file.seek(SeekFrom::End(0))?;
-        Ok((file, size, None))
+        Ok((file, size, 1))
     }
-
-    pub fn write_partial(file: &File, off: u64, data: &[u8], _sector: u64) -> io::Result<()> {
-        write_all_at(file, data, off)
-    }
-}
-
-/// Writes a partial sector on a device that only takes whole ones: reads the sectors
-/// around it, patches them, and writes them back.
-#[cfg(any(target_os = "macos", windows))]
-fn read_modify_write(file: &File, off: u64, data: &[u8], sector: u64) -> io::Result<()> {
-    let start = off - off % sector;
-    let span = (round_up(off + data.len() as u64, sector) - start) as usize;
-    let mut whole = AlignedBuf::new(span);
-    read_exact_at(file, &mut whole, start)?;
-    let at = (off - start) as usize;
-    whole[at..at + data.len()].copy_from_slice(data);
-    write_all_at(file, &whole, start)
 }

@@ -9,9 +9,9 @@
 	<key>CFBundleExecutable</key>
 	<string>dd-gui</string>
 	<key>CFBundleIconFile</key>
-	<string>DD-GUI</string>
+	<string>dd-gui</string>
 	<key>CFBundleIdentifier</key>
-	<string>io.github.ddgui.DD-GUI</string>
+	<string>io.github.sir-mmd.dd-gui</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

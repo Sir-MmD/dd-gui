@@ -13,32 +13,32 @@ use std::io::Cursor;
 use util::{ALIGN, GAP, MAX_EXTENTS};
 
 /// Deterministic pseudo-random numbers (xorshift64*).
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
 
-    fn bytes(&mut self, n: usize) -> Vec<u8> {
+    pub(crate) fn bytes(&mut self, n: usize) -> Vec<u8> {
         (0..n).map(|_| self.next() as u8).collect()
     }
 
     /// Usually `sane`, sometimes anything at all.
-    fn wild(&mut self, sane: u64) -> u64 {
+    pub(crate) fn wild(&mut self, sane: u64) -> u64 {
         if self.below(5) == 0 { self.next() >> self.below(64) } else { sane }
     }
 }
 
 /// What every layout promises, whatever the input.
-fn check_invariants(l: &Layout) {
+pub(crate) fn check_invariants(l: &Layout) {
     let mut prev_end: Option<u64> = None;
     for e in &l.extents {
         let end = e.start + e.len;
@@ -59,7 +59,7 @@ fn check_invariants(l: &Layout) {
     }
 }
 
-fn analyze_bytes(data: &[u8], size: u64) -> io::Result<Layout> {
+pub(crate) fn analyze_bytes(data: &[u8], size: u64) -> io::Result<Layout> {
     analyze(&mut Cursor::new(data), size)
 }
 
@@ -98,7 +98,7 @@ fn reading_past_the_end_is_an_error_or_conservative() {
 }
 
 /// An MBR (or EBR) sector with the given entries: (boot, type, start, sectors).
-fn mbr_sector(entries: &[(u8, u8, u32, u32)]) -> [u8; 512] {
+pub(crate) fn mbr_sector(entries: &[(u8, u8, u32, u32)]) -> [u8; 512] {
     let mut s = [0u8; 512];
     for (i, &(boot, kind, start, sectors)) in entries.iter().enumerate() {
         let e = 0x1BE + 16 * i;
@@ -314,7 +314,7 @@ fn inspect() {
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(crate) mod linux {
     use super::*;
     use std::collections::BTreeMap;
     use std::fs::{self, File};
@@ -323,23 +323,54 @@ mod linux {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    const MB: u64 = 1 << 20;
+    pub(crate) const MB: u64 = 1 << 20;
 
     /// A directory for one test's images, removed afterwards.
-    struct Scratch(PathBuf);
+    pub(crate) struct Scratch(PathBuf, Slot);
+
+    /// How many tests may hold scratch images at once. All together the images take close to
+    /// 6 GB, more than a RAM-backed /tmp has room for next to the engine's tests.
+    const SLOTS: usize = 3;
+    static IN_USE: (std::sync::Mutex<usize>, std::sync::Condvar) =
+        (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+    /// One of the `SLOTS`, held for as long as a test's `Scratch` lives.
+    pub(crate) struct Slot;
+
+    impl Slot {
+        fn take() -> Slot {
+            let (count, freed) = &IN_USE;
+            // A test that panicked while holding the lock poisons it; the count is still right.
+            let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+            while *n >= SLOTS {
+                n = freed.wait(n).unwrap_or_else(|e| e.into_inner());
+            }
+            *n += 1;
+            Slot
+        }
+    }
+
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            let (count, freed) = &IN_USE;
+            *count.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            freed.notify_one();
+        }
+    }
 
     impl Scratch {
-        fn new(name: &str) -> Scratch {
+        pub(crate) fn new(name: &str) -> Scratch {
+            let slot = Slot::take();
             let base = std::env::var_os("DD_GUI_SMART_SCRATCH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::temp_dir().join("dd-gui-smart-tests"));
             let dir = base.join(format!("{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
+            Scratch(dir, slot)
         }
 
-        fn join(&self, name: &str) -> PathBuf {
+        pub(crate) fn join(&self, name: &str) -> PathBuf {
             self.0.join(name)
         }
     }
@@ -352,12 +383,12 @@ mod linux {
         }
     }
 
-    fn on_path(tool: &str) -> bool {
+    pub(crate) fn on_path(tool: &str) -> bool {
         std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(tool).is_file()))
     }
 
     /// True when all the tools are installed; says which aren't otherwise.
-    fn have(tools: &[&str]) -> bool {
+    pub(crate) fn have(tools: &[&str]) -> bool {
         let missing: Vec<_> = tools.iter().filter(|t| !on_path(t)).collect();
         if !missing.is_empty() {
             eprintln!("skipped: {missing:?} not installed");
@@ -366,7 +397,7 @@ mod linux {
     }
 
     /// Whether `mkfs` accepts `args` (older versions lack some options): tried on a scratch file.
-    fn supports(s: &Scratch, mkfs: &str, args: &[&str], size: u64) -> bool {
+    pub(crate) fn supports(s: &Scratch, mkfs: &str, args: &[&str], size: u64) -> bool {
         let img = s.join("probe.img");
         blank(&img, size);
         let mut all = args.to_vec();
@@ -379,46 +410,46 @@ mod linux {
         ok
     }
 
-    fn try_sh(cmd: &str, args: &[&str]) -> (bool, String) {
+    pub(crate) fn try_sh(cmd: &str, args: &[&str]) -> (bool, String) {
         let out = Command::new(cmd).args(args).stdin(Stdio::null()).output().unwrap_or_else(|e| panic!("{cmd}: {e}"));
         let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
         (out.status.success(), text)
     }
 
     /// Runs a command, panicking with its output unless it succeeds.
-    fn sh(cmd: &str, args: &[&str]) -> String {
+    pub(crate) fn sh(cmd: &str, args: &[&str]) -> String {
         let (ok, text) = try_sh(cmd, args);
         assert!(ok, "{cmd} {args:?} failed:\n{text}");
         text
     }
 
-    fn p(path: &Path) -> &str {
+    pub(crate) fn p(path: &Path) -> &str {
         path.to_str().unwrap()
     }
 
-    fn blank(path: &Path, size: u64) {
+    pub(crate) fn blank(path: &Path, size: u64) {
         File::create(path).unwrap().set_len(size).unwrap();
     }
 
-    fn file_size(path: &Path) -> u64 {
+    pub(crate) fn file_size(path: &Path) -> u64 {
         fs::metadata(path).unwrap().len()
     }
 
     /// Copies all of `src` into `img` at `offset`, like `dd conv=notrunc seek=…`.
-    fn put(img: &Path, offset: u64, src: &Path) {
+    pub(crate) fn put(img: &Path, offset: u64, src: &Path) {
         let data = fs::read(src).unwrap();
         let mut f = fs::OpenOptions::new().write(true).open(img).unwrap();
         f.seek(SeekFrom::Start(offset)).unwrap();
         f.write_all(&data).unwrap();
     }
 
-    fn put_bytes(img: &Path, offset: u64, data: &[u8]) {
+    pub(crate) fn put_bytes(img: &Path, offset: u64, data: &[u8]) {
         let mut f = fs::OpenOptions::new().write(true).open(img).unwrap();
         f.seek(SeekFrom::Start(offset)).unwrap();
         f.write_all(data).unwrap();
     }
 
-    fn read_range(img: &Path, start: u64, len: u64) -> Vec<u8> {
+    pub(crate) fn read_range(img: &Path, start: u64, len: u64) -> Vec<u8> {
         let mut f = File::open(img).unwrap();
         f.seek(SeekFrom::Start(start)).unwrap();
         let mut buf = vec![0; len as usize];
@@ -427,10 +458,10 @@ mod linux {
     }
 
     /// Files (path → content) for a file system.
-    type Tree = BTreeMap<String, Vec<u8>>;
+    pub(crate) type Tree = BTreeMap<String, Vec<u8>>;
 
     /// `count` files of mixed sizes (up to `max`) in a few directories, names prefixed with `tag`.
-    fn make_tree(rng: &mut Rng, tag: &str, count: usize, max: u64) -> Tree {
+    pub(crate) fn make_tree(rng: &mut Rng, tag: &str, count: usize, max: u64) -> Tree {
         (0..count)
             .map(|i| {
                 let size = match rng.below(10) {
@@ -449,7 +480,7 @@ mod linux {
             .collect()
     }
 
-    fn write_tree(tree: &Tree, dir: &Path) {
+    pub(crate) fn write_tree(tree: &Tree, dir: &Path) {
         for (name, data) in tree {
             let path = dir.join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -457,7 +488,7 @@ mod linux {
         }
     }
 
-    fn read_tree(dir: &Path, prefix: &str, out: &mut Tree) {
+    pub(crate) fn read_tree(dir: &Path, prefix: &str, out: &mut Tree) {
         for entry in fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().into_string().unwrap();
@@ -473,7 +504,7 @@ mod linux {
     }
 
     /// Err describes the first difference between the files in `dir` and `expected`.
-    fn compare(expected: &Tree, dir: &Path) -> Result<(), String> {
+    pub(crate) fn compare(expected: &Tree, dir: &Path) -> Result<(), String> {
         let mut found = Tree::new();
         read_tree(dir, "", &mut found);
         for (name, data) in expected {
@@ -491,7 +522,7 @@ mod linux {
 
     /// The smart copy: a file of the same size where only `extents` come from `src`, and
     /// everything else is garbage (0xA5), which is harsher than zeros.
-    fn smart_copy(src: &Path, extents: &[Extent], dst: &Path) {
+    pub(crate) fn smart_copy(src: &Path, extents: &[Extent], dst: &Path) {
         let size = file_size(src);
         let mut out = File::create(dst).unwrap();
         let fill = vec![0xA5u8; MB as usize];
@@ -516,7 +547,7 @@ mod linux {
         }
     }
 
-    fn layout_of(img: &Path) -> Layout {
+    pub(crate) fn layout_of(img: &Path) -> Layout {
         let mut f = File::open(img).unwrap();
         let size = f.metadata().unwrap().len();
         let layout = analyze(&mut f, size).unwrap();
@@ -524,7 +555,7 @@ mod linux {
         layout
     }
 
-    fn estimate_of(img: &Path) -> Layout {
+    pub(crate) fn estimate_of(img: &Path) -> Layout {
         let mut f = File::open(img).unwrap();
         let size = f.metadata().unwrap().len();
         estimate(&mut f, size).unwrap()
@@ -533,7 +564,7 @@ mod linux {
     /// What one partition's file system uses, exactly (no merging, no alignment, no drive
     /// edges): its ranges plus the head and tail copied with it. None with the reason when
     /// it isn't understood.
-    fn fs_usage(img: &Path, start: u64, size: u64) -> Result<Vec<Extent>, String> {
+    pub(crate) fn fs_usage(img: &Path, start: u64, size: u64) -> Result<Vec<Extent>, String> {
         let mut f = File::open(img).unwrap();
         let total = f.metadata().unwrap().len();
         let mut disk = Disk::new(&mut f, total);
@@ -546,7 +577,7 @@ mod linux {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Kind {
+    pub(crate) enum Kind {
         Fat,
         Exfat,
         Ntfs,
@@ -554,14 +585,14 @@ mod linux {
     }
 
     /// A file system image and the files it should hold.
-    struct Fixture {
-        img: PathBuf,
-        kind: Kind,
-        files: Tree,
+    pub(crate) struct Fixture {
+        pub(crate) img: PathBuf,
+        pub(crate) kind: Kind,
+        pub(crate) files: Tree,
     }
 
     /// The first number after `key` in the tool's output.
-    fn number_after(text: &str, key: &str) -> Option<u64> {
+    pub(crate) fn number_after(text: &str, key: &str) -> Option<u64> {
         let at = text.find(key)? + key.len();
         text[at..].trim_start().chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
     }
@@ -736,7 +767,7 @@ mod linux {
 
     /// Runs a command as root. Without a terminal (or cached credentials), the password
     /// comes from `DD_GUI_TEST_SUDO_PASSWORD`.
-    fn sudo(args: &[&str]) -> (bool, String) {
+    pub(crate) fn sudo(args: &[&str]) -> (bool, String) {
         let password = std::env::var("DD_GUI_TEST_SUDO_PASSWORD").ok();
         let mut cmd = Command::new("sudo");
         if password.is_some() {
@@ -815,7 +846,7 @@ mod linux {
         }
     }
 
-    fn can_sudo() -> bool {
+    pub(crate) fn can_sudo() -> bool {
         have(&["sudo", "losetup", "mount", "umount"])
     }
 
@@ -876,7 +907,7 @@ mod linux {
     /// The full treatment for one file system at `start..start + size` of `img`: numbers,
     /// then a smart copy that must pass fsck and hold every file, then proof that the check
     /// notices a missing extent.
-    fn check_fs(f: &Fixture, s: &Scratch, disk: &Path, start: u64, size: u64, layout: &Layout) {
+    pub(crate) fn check_fs(f: &Fixture, s: &Scratch, disk: &Path, start: u64, size: u64, layout: &Layout) {
         let covered = check_numbers(f.kind, disk, start, size);
         let copy = s.join("copy.img");
         // The file system on its own, as the tools want it (the copy itself for a whole drive).
@@ -922,11 +953,11 @@ mod linux {
     }
 
     /// Files to keep, plus files written and then deleted, so free space holds stale data.
-    fn trees(rng: &mut Rng, count: usize, max: u64) -> (Tree, Tree) {
+    pub(crate) fn trees(rng: &mut Rng, count: usize, max: u64) -> (Tree, Tree) {
         (make_tree(rng, "keep", count, max), make_tree(rng, "gone", count / 3, max))
     }
 
-    fn fat_image(s: &Scratch, name: &str, size: u64, args: &[&str], count: usize, max: u64) -> Fixture {
+    pub(crate) fn fat_image(s: &Scratch, name: &str, size: u64, args: &[&str], count: usize, max: u64) -> Fixture {
         let mut rng = Rng(size ^ count as u64);
         let img = s.join(name);
         blank(&img, size);
@@ -949,7 +980,7 @@ mod linux {
         Fixture { img, kind: Kind::Fat, files: keep }
     }
 
-    fn ext_image(s: &Scratch, name: &str, size: u64, args: &[&str], count: usize, max: u64) -> Fixture {
+    pub(crate) fn ext_image(s: &Scratch, name: &str, size: u64, args: &[&str], count: usize, max: u64) -> Fixture {
         let mut rng = Rng(size ^ count as u64 ^ args.len() as u64);
         let img = s.join(name);
         let (keep, gone) = trees(&mut rng, count, max);
@@ -1471,6 +1502,15 @@ mod linux {
         assert_eq!(l.partitions.len(), b.fixtures.len());
         for (part, (index, fixture, start, len)) in l.partitions.iter().zip(&b.fixtures) {
             assert_eq!((part.index, part.start, part.size), (*index, *start, *len));
+            if part.fs.as_deref() == Some("swap") {
+                // Only the swap header is needed: it's in what's always kept at a partition's
+                // start, and nothing else of the partition is copied.
+                assert!(part.understood, "{part:?}");
+                assert_eq!(part.used, HEAD_KEPT, "{part:?}");
+                assert_eq!(util::overlap(&l.extents, *start, HEAD_KEPT), HEAD_KEPT);
+                assert_eq!(util::overlap(&l.extents, start + HEAD_KEPT, len - HEAD_KEPT), 0, "swap space copied");
+                continue;
+            }
             assert_eq!(part.understood, fixture.is_some(), "{part:?}");
             if let Some(f) = fixture {
                 check_fs(f, s, &b.disk, *start, *len, l);

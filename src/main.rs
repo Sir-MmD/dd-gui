@@ -18,16 +18,21 @@ fn main() {
         // `dd-gui copy …` is DD-GUI's own copier: smart copies and compressed images.
         Some(arg) if arg == "copy" => std::process::exit(engine::main()),
         // `dd-gui drives`: the drive list as JSON (what the GUI shows; handy for scripts and tests).
-        Some(arg) if arg == "drives" => std::process::exit(match drives::list() {
-            Ok(list) => {
-                println!("{}", serde_json::to_string_pretty(&list).unwrap_or_default());
-                0
-            }
-            Err(err) => {
-                eprintln!("dd-gui: {err}");
-                1
-            }
-        }),
+        Some(arg) if arg == "drives" => {
+            // Output to the terminal it was started from (the exe has no console of its own).
+            #[cfg(windows)]
+            worker::attach_console();
+            std::process::exit(match drives::list() {
+                Ok(list) => {
+                    println!("{}", serde_json::to_string_pretty(&list).unwrap_or_default());
+                    0
+                }
+                Err(err) => {
+                    eprintln!("dd-gui: {err}");
+                    1
+                }
+            })
+        }
         _ => {}
     }
     if let Err(err) = app::run() {

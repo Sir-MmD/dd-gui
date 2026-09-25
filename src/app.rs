@@ -67,7 +67,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     ui.on_reveal(|| app().reveal());
     ui.on_open_repository(|| open_url(env!("CARGO_PKG_REPOSITORY")));
 
-    // `DD-GUI some.iso` (e.g. "Open with" in a file manager) starts with that image chosen.
+    // `dd-gui some.iso` (e.g. "Open with" in a file manager) starts with that image chosen.
     if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
         instance.set_source_file(path.canonicalize().unwrap_or(path));
     }
@@ -75,12 +75,6 @@ pub fn run() -> Result<(), slint::PlatformError> {
     instance.refresh();
     instance.load_drives();
     ui.run()
-}
-
-/// Either end of a copy, so both can be walked together.
-enum Endpoint<'a> {
-    Source(&'a Source),
-    Target(&'a Target),
 }
 
 /// The drive layout a worker reports before a copy from a drive (`smart::Layout` as JSON).
@@ -142,6 +136,8 @@ struct State {
     job: Option<Job>,
     pending: Option<Pending>,
     run: Option<Run>,
+    /// Start was clicked and the chosen drives are being checked again.
+    rechecking: bool,
 }
 
 struct App {
@@ -221,7 +217,7 @@ impl App {
             Source::None if ui.get_source_mode() == 1 => {
                 (1, "Choose a drive".to_owned(), "Back it up or clone it".to_owned(), String::new())
             }
-            Source::None => (0, "Choose an image".to_owned(), "ISO, IMG, compressed or DD-GUI images".to_owned(), String::new()),
+            Source::None => (0, "Choose an image".to_owned(), "ISO, IMG, DMG, VHD, VMDK, QCOW2 or compressed".to_owned(), String::new()),
         };
         ui.set_source_set(!matches!(source, Source::None));
         ui.set_source_glyph(glyph);
@@ -295,7 +291,8 @@ impl App {
         let ui = self.ui();
         self.clear_notice();
         let suggested = match self.source(&ui) {
-            Source::Drive(d) => format!("{}.img", d.name.replace(['/', '\\', ':'], "-")),
+            // Without the characters Windows (or macOS, or Linux) won't have in a file name.
+            Source::Drive(d) => format!("{}.img", d.name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "-")),
             Source::File { path, .. } => format!("Copy of {}", file_name(&path)),
             _ => "image.img".to_owned(),
         };
@@ -323,7 +320,9 @@ impl App {
         self.show_drives();
         ui.set_picker_open(true);
         self.load_drives();
-        self.poller.start(TimerMode::Repeated, Duration::from_secs(2), || {
+        // Listing drives means starting PowerShell on Windows, which takes a second or two.
+        let every = Duration::from_secs(if cfg!(windows) { 4 } else { 2 });
+        self.poller.start(TimerMode::Repeated, every, || {
             let app = app();
             if app.ui().get_picker_open() {
                 app.load_drives();
@@ -454,17 +453,14 @@ impl App {
 
     fn busy(&self) -> bool {
         let st = self.state.borrow();
-        st.job.is_some() || st.pending.is_some()
+        st.job.is_some() || st.pending.is_some() || st.rechecking
     }
 
     /// Makes sure a chosen drive is still the same one: sticks get swapped, and
     /// /dev/sdb may be a different drive now than when it was picked.
-    fn recheck(&self, drive: &Drive) -> Result<Drive, String> {
-        let list = drives::list()?;
-        let fresh = list.iter().find(|d| d.path == drive.path).cloned();
-        self.state.borrow_mut().drives = list;
-        match fresh {
-            Some(d) if d.size == drive.size && d.name == drive.name => Ok(d),
+    fn recheck(drive: &Drive, list: &[Drive]) -> Result<Drive, String> {
+        match list.iter().find(|d| d.path == drive.path) {
+            Some(d) if d.size == drive.size && d.name == drive.name => Ok(d.clone()),
             Some(_) => Err(format!("{} changed since you picked it. Choose the drive again.", drive.path)),
             None => Err(format!("{} is no longer connected.", drive.name)),
         }
@@ -475,26 +471,67 @@ impl App {
         if self.busy() {
             return;
         }
+        // An old message ("The password prompt was dismissed.") goes as soon as Start is clicked.
         self.clear_notice();
-        let (source, target) = (self.source(&ui), self.target(&ui));
-        for drive in [Endpoint::Source(&source), Endpoint::Target(&target)].into_iter().filter_map(|e| match e {
-            Endpoint::Source(Source::Drive(d)) | Endpoint::Target(Target::Drive(d)) => Some(d),
-            _ => None,
-        }) {
-            if let Err(err) = self.recheck(drive) {
-                let mut st = self.state.borrow_mut();
-                if st.source_drive.as_ref().is_some_and(|d| d.path == drive.path) {
-                    st.source_drive = None;
+        self.refresh();
+        let chosen = chosen_drives(&self.source(&ui), &self.target(&ui));
+        if chosen.is_empty() {
+            return self.start_checked();
+        }
+        // One fresh scan for both drives, off the UI thread: listing drives means starting
+        // PowerShell on Windows, which takes a second or two.
+        self.state.borrow_mut().rechecking = true;
+        ui.set_starting(true);
+        std::thread::spawn(move || {
+            let result = drives::list();
+            post(move |app| app.rechecked(chosen, result));
+        });
+    }
+
+    /// Start, continued with a fresh list of drives.
+    fn rechecked(&self, chosen: Vec<Drive>, result: Result<Vec<Drive>, String>) {
+        let ui = self.ui();
+        self.state.borrow_mut().rechecking = false;
+        ui.set_starting(false);
+        // Something else was picked in the meantime: that's for another click on Start.
+        let now = chosen_drives(&self.source(&ui), &self.target(&ui));
+        if now.iter().map(|d| &d.path).ne(chosen.iter().map(|d| &d.path)) {
+            return;
+        }
+        let list = match result {
+            Ok(list) => list,
+            Err(err) => {
+                self.state.borrow_mut().notice = Some(err);
+                self.refresh();
+                return;
+            }
+        };
+        self.state.borrow_mut().drives = list.clone();
+        for drive in &chosen {
+            let fresh = Self::recheck(drive, &list);
+            let mut guard = self.state.borrow_mut();
+            let st = &mut *guard;
+            // Go on with what the drive holds now: a partition mounted (or a volume
+            // given a letter) since it was picked must be unmounted (locked) too.
+            for slot in [&mut st.source_drive, &mut st.target_drive] {
+                if slot.as_ref().is_some_and(|d| d.path == drive.path) {
+                    *slot = fresh.clone().ok();
                 }
-                if st.target_drive.as_ref().is_some_and(|d| d.path == drive.path) {
-                    st.target_drive = None;
-                }
+            }
+            if let Err(err) = fresh {
                 st.notice = Some(err);
-                drop(st);
+                drop(guard);
                 self.refresh();
                 return;
             }
         }
+        self.start_checked();
+    }
+
+    /// Start, once any chosen drives are known to still be the ones picked.
+    fn start_checked(&self) {
+        let ui = self.ui();
+        let (source, target) = (self.source(&ui), self.target(&ui));
         let Ok(opts) = self.options(&ui) else { return };
         let drives = self.state.borrow().drives.clone();
         if (Plan { source: &source, target: &target, opts: &opts, drives: &drives }).problem().is_some() {
@@ -548,11 +585,13 @@ impl App {
             _ => return,
         };
         let mut unmount = Vec::new();
+        let mut lock = Vec::new();
         // Unmounting keeps the copy consistent, but the running system's drive can't be.
+        // (Windows: locking its volumes does the same.)
         if !drive.system {
             unmount.extend(drive.unmount.iter().cloned());
+            lock.extend(drive.lock.iter().cloned());
         }
-        let mut lock = Vec::new();
         if let Target::Drive(d) = &target {
             unmount.extend(d.unmount.iter().cloned());
             lock.extend(d.lock.iter().cloned());
@@ -656,13 +695,13 @@ impl App {
             }
             .into(),
         );
-        let mut read: Vec<String> = layout
-            .partitions
-            .iter()
-            .filter(|p| p.understood)
-            .filter_map(|p| p.fs.clone())
-            .collect();
-        read.dedup();
+        let mut read: Vec<String> = Vec::new();
+        for fs in layout.partitions.iter().filter(|p| p.understood).filter_map(|p| p.fs.as_deref()) {
+            let name = fmt::fs_name(fs);
+            if !read.contains(&name) {
+                read.push(name);
+            }
+        }
         ui.set_smart_foot(if read.is_empty() { "nothing it can read".to_owned() } else { format!("reads {}", read.join(" · ")) }.into());
         ui.set_full_foot("dd · every sector".into());
 
@@ -673,7 +712,7 @@ impl App {
             .map(|p| {
                 let name = p.label.clone().unwrap_or_else(|| format!("partition {}", p.index));
                 match &p.fs {
-                    Some(fs) => format!("{name} ({fs})"),
+                    Some(fs) => format!("{name} ({})", fmt::fs_name(fs)),
                     None => name,
                 }
             })
@@ -766,7 +805,8 @@ impl App {
             // A smart image's output is compressed: judge speed by what was read.
             output_is_compressed: smart && pending.smart_file.is_some(),
             skipped: smart.then(|| layout.size.saturating_sub(layout.used())),
-            unmounted_source: (!pending.source.system && !pending.source.unmount.is_empty()).then(|| pending.source.clone()),
+            unmounted_source: (!pending.source.system && !(pending.source.unmount.is_empty() && pending.source.lock.is_empty()))
+                .then(|| pending.source.clone()),
         };
         {
             let mut st = self.state.borrow_mut();
@@ -862,8 +902,11 @@ impl App {
             _ => Work::Dd(plan.args()),
         };
         let sync = plan.sync_after();
-        let compressed_units =
-            matches!(&source, Source::File { info, .. } if restore && info.smart.is_none() && info.format != ImageFormat::Raw);
+        // The copier counts compressed bytes read for the stream formats it unpacks itself;
+        // virtual disks, archives and the other formats count bytes written.
+        let compressed_units = matches!(&source, Source::File { info, .. }
+            if restore && info.smart.is_none()
+                && matches!(info.format, ImageFormat::Gzip | ImageFormat::Xz | ImageFormat::Zstd | ImageFormat::Zip));
         let verb = match (&source, &target) {
             (Source::Zeros, _) => "Wiping",
             (_, Target::Drive(_)) => "Writing",
@@ -1015,7 +1058,7 @@ impl App {
             match run.total {
                 _ if run.compressed_units => format!("{} written", fmt::bytes(run.bytes_written())),
                 Some(total) => format!("{} of {}", fmt::bytes(run.done), fmt::bytes(total)),
-                None => fmt::bytes(run.done),
+                None => format!("{} written", fmt::bytes(run.done)),
             }
             .into(),
         );
@@ -1059,9 +1102,22 @@ impl App {
             st.run.take()
         };
         let Some(run) = run else { return };
-        // The worker unmounted the drive it copied from; mount it again for the user.
-        if let Some(source) = run.unmounted_source.as_ref() {
-            let _ = drives::remount(source);
+        match run.unmounted_source.clone() {
+            // The worker unmounted the drive it copied from: mount it again for the user (off the
+            // UI thread, since it waits for the OS), then list the drives with their mount points.
+            Some(source) => {
+                std::thread::spawn(move || {
+                    let result = drives::remount(&source);
+                    post(move |app| {
+                        if let Err(err) = result {
+                            app.state.borrow_mut().notice = Some(format!("Couldn't mount {} again: {err}", source.name));
+                            app.refresh();
+                        }
+                        app.load_drives();
+                    });
+                });
+            }
+            None => self.load_drives(),
         }
         let elapsed = run.elapsed().as_secs_f64();
         let written = run.bytes_moved();
@@ -1127,7 +1183,6 @@ impl App {
                 ui.set_result_can_reveal(false);
             }
         }
-        self.load_drives();
     }
 
     fn finish(&self) {
@@ -1142,6 +1197,18 @@ impl App {
         let Some(path) = st.run.as_ref().and_then(|r| r.target_file.clone()) else { return };
         reveal_in_file_manager(&path);
     }
+}
+
+/// The drives among a source and a target, in that order.
+fn chosen_drives(source: &Source, target: &Target) -> Vec<Drive> {
+    let mut drives = Vec::new();
+    if let Source::Drive(d) = source {
+        drives.push(d.clone());
+    }
+    if let Target::Drive(d) = target {
+        drives.push(d.clone());
+    }
+    drives
 }
 
 fn set_stats(ui: &AppWindow, stats: &[(&str, String)]) {
@@ -1396,12 +1463,10 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
+    // Through the desktop's own Explorer, so the browser doesn't start as administrator the
+    // way DD-GUI runs (and no cmd.exe, which would take `&` in a URL as a command separator).
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: no console flashing up for `start`.
-        let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).creation_flags(0x0800_0000).spawn();
-    }
+    let _ = std::process::Command::new(windows_explorer()).arg(url).spawn();
 }
 
 fn reveal_in_file_manager(path: &Path) {
@@ -1410,5 +1475,17 @@ fn reveal_in_file_manager(path: &Path) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
     #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+    {
+        use std::os::windows::process::CommandExt;
+        // Explorer wants the quotes around the path only: /select,"C:\My Images\x.img".
+        let _ = std::process::Command::new(windows_explorer()).raw_arg(format!("/select,\"{}\"", path.display())).spawn();
+    }
+}
+
+/// Explorer by its full path: DD-GUI runs as administrator, and a bare "explorer" would be
+/// looked for next to dd-gui.exe first (in Downloads, say).
+#[cfg(windows)]
+fn windows_explorer() -> PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    Path::new(&root).join("explorer.exe")
 }

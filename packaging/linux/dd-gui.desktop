@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=DD-GUI
+GenericName=Disk Imager
+Comment=Flash images to USB drives and SD cards, back up, clone and wipe drives
+TryExec=dd-gui
+Exec=dd-gui %f
+Icon=dd-gui
+Terminal=false
+Categories=System;Utility;
+Keywords=dd;flash;burn;write;iso;img;image;usb;sd;card;drive;disk;backup;clone;wipe;
+StartupWMClass=dd-gui
+MimeType=application/vnd.efi.iso;application/x-cd-image;application/x-iso9660-image;application/vnd.efi.img;application/x-raw-disk-image;application/x-raw-disk-image-xz-compressed;application/gzip;application/x-xz;application/zstd;application/x-bzip2;application/x-lz4;application/x-lzma;application/zip;application/x-7z-compressed;application/x-apple-diskimage;application/x-vhd-disk;application/x-vhdx-disk;application/x-vmdk-disk;application/x-qemu-disk;

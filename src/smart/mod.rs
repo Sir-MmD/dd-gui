@@ -1,14 +1,24 @@
 //! Smart copy: find which parts of a drive actually hold data.
 //!
-//! `analyze` reads the partition table (MBR, GPT) and the allocation maps of the
-//! file systems it understands (FAT12/16/32, exFAT, NTFS, ext2/3/4). Anything it
-//! doesn't understand counts as used, so a smart copy never drops data a file
-//! system needs; it only skips free space.
+//! `analyze` reads the partition table (MBR with its logical partitions and BSD disklabels,
+//! GPT, Apple partition map) and the allocation maps of what it understands:
+//! - FAT12/16/32, exFAT, NTFS, ext2/3/4;
+//! - btrfs (on one device), XFS (v4 and v5), F2FS;
+//! - HFS+ and HFSX, APFS;
+//! - LVM2 physical volumes: plain logical volumes are read like partitions of their own,
+//!   the others (thin pools, RAID, snapshots, LVs on several PVs…) keep all their extents;
+//! - Linux swap (its header only), ISO 9660 (its volume only), UDF.
+//!
+//! Anything it doesn't understand counts as used, so a smart copy never drops data a file
+//! system needs; it only skips free space. Many more file systems and containers are
+//! recognised by name (LUKS, BitLocker, ZFS, bcachefs, JFS, ReiserFS, VMFS…) and copied in
+//! full.
 //!
 //! Always copied: the first and last MiB of the drive (boot code, partition tables, the
 //! backup GPT, RAID metadata), every EBR, the first 64 KiB of each partition, and whatever
 //! lies between the end of a file system and the end of its partition. A file system that
-//! looks inconsistent, ambiguous, or not cleanly unmounted is copied in full.
+//! looks inconsistent, ambiguous, or not cleanly unmounted (a journal or log to replay, a
+//! swap area holding a hibernation image) is copied in full.
 
 mod apfs;
 mod btrfs;
@@ -51,6 +61,8 @@ pub enum Table {
     None,
     Mbr,
     Gpt,
+    /// An Apple partition map.
+    Apm,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -200,6 +212,12 @@ fn partition(disk: &mut Disk, slot: &partitions::Slot, opts: Opts) -> Found {
         Err(err) => return in_full(None, None, format!("unreadable: {err}")),
     };
     let found = probe::detect(&head);
+    // What lies further in says more than the first bytes (which may be stale).
+    match probe::far(disk, start, size) {
+        Ok(None) => {}
+        Ok(Some(far)) => return in_full(Some(far), None, format!("{far} signature past the start")),
+        Err(err) => return in_full(None, None, format!("unreadable: {err}")),
+    }
     let strong: Vec<Fs> = found.iter().copied().filter(|f| !f.weak()).collect();
     let Some(&kind) = strong.first().or(found.first()) else {
         return in_full(None, None, "nothing recognised".into());

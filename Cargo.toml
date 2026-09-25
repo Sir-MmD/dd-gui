@@ -24,22 +24,28 @@ uucore = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.17"
-# Smart images (.img.zst) and .zst restores: the official libzstd, multithreaded.
-zstd = { version = "0.14", features = ["zstdmt"] }
+# Smart images (.img.zst) and .zst restores: the official libzstd. (DD-GUI compresses
+# independent frames on its own threads, so libzstd's multithreading isn't needed.)
+zstd = "0.14"
 # Other compressed images (`dd-gui copy`).
-# gzip decoding (zlib-rs backend)
+# gzip decoding (zlib-rs backend), for .gz images and older smart images (.img.gz)
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
-# gzip encoding of data: fast, and stores incompressible blocks instead of growing them
-miniz_oxide = "0.9"
 lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz", "optimization"] }
-ruzstd = "0.9"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64"] }
+# Image formats (engine/formats)
+# bzip2 (pure-Rust libbz2-rs-sys backend), for .bz2 and DMG (UDBZ) chunks
+bzip2 = "0.6"
+# LZ4 frames
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "frame", "safe-decode", "checked-decode"] }
+# 7z archives: decoding only (no AES; encrypted archives are refused)
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["bzip2", "deflate", "ppmd", "zstd", "lz4"] }
+# DMG (ULFO) chunks
+lzfse_rust = "0.2"
+# DMG: the property list that describes the chunks (src/drives/macos.rs uses it too)
+plist = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-plist = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -54,8 +60,9 @@ windows-sys = { version = "0.61", features = [
 
 [build-dependencies]
 slint-build = "1.18"
+# dd-gui.exe's manifest (administrator rights), and its icon and version info; build.rs
+# uses both for Windows targets only
 embed-manifest = "1.5"
-# DD-GUI.exe's icon and version info (build.rs only uses it for Windows targets)
 winresource = { version = "0.1.31", default-features = false }
 
 [profile.release]
@@ -63,3 +70,9 @@ lto = true
 codegen-units = 1
 strip = true
 opt-level = 3
+
+[patch.crates-io]
+# Slint 1.18.1's winit backend with one fix: it divided by zero when a monitor reports
+# 0 Hz, as Windows may in VMs and remote sessions (see vendor/README.md). Drop this once
+# Slint ships the fix.
+i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }

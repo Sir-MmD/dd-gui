@@ -1,36 +1,54 @@
-//! `DD-GUI copy …`: DD-GUI's own copier, for what plain dd doesn't do well:
-//! smart copies (only the used blocks) and compressed images.
+//! `dd-gui copy …`: DD-GUI's own copier, for what plain dd doesn't do well: smart copies
+//! (only the used blocks), compressed images and virtual disks, and zeros where there's no
+//! /dev/zero (Windows).
 //!
 //! ```text
-//! DD-GUI copy [PLUMBING…] --mode=smart|restore --from=PATH --to=PATH [--ask] [--block-size=N] [-- DD_OPERANDS…]
+//! dd-gui copy [PLUMBING…] --mode=smart   --from=PATH --to=PATH [--ask] [--block-size=N] [-- DD_OPERANDS…]
+//! dd-gui copy [PLUMBING…] --mode=restore --from=PATH --to=PATH [--block-size=N]
+//! dd-gui copy [PLUMBING…] --mode=zeros   --to=PATH [--size=N] [--block-size=N]
 //! ```
 //!
-//! PLUMBING are the `--ddgui-*` options shared with `DD-GUI dd` (see worker.rs):
+//! PLUMBING are the `--ddgui-*` options shared with `dd-gui dd` (see worker.rs):
 //! `--ddgui-worker`, `--ddgui-watch-stdin`, `--ddgui-cancel-file=PATH`,
 //! `--ddgui-answer-file=PATH`, `--ddgui-parent=PID`, `--ddgui-unmount=DEV`,
-//! `--ddgui-lock=X:`, `--ddgui-sync=DEV`.
+//! `--ddgui-lock=VOLUME`, `--ddgui-sync=DEV`.
 //!
 //! * `--mode=smart`: `--from` is a drive (or a raw disk image file). Only the extents
 //!   from `crate::smart::analyze` are read. If `--to` is a drive (a block or character
 //!   device), they are written in place and free space on the target is left alone.
-//!   Otherwise `--to` becomes a gzip "smart image" of the whole drive, with free space
-//!   as zeros and the extent map in the gzip header, so DD-GUI can restore it quickly.
-//!   Plain `gunzip` still gives a correct raw image. (Format: see image.rs.)
-//! * `--mode=restore`: `--from` is an image: raw, `.gz` (smart images included), `.xz`,
-//!   `.zst`, or `.zip` (its first file). It is decompressed on the fly and written to
-//!   `--to`, a drive or a file. For smart images, free space is skipped on the target.
-//!   The format comes from the file's first bytes, not its name. A drive counts as raw.
+//!   Otherwise `--to` becomes a zstd "smart image" of the whole drive (named `.img.zst`
+//!   by the GUI): free space costs next to nothing, a map of the used space comes first
+//!   and a seek table last, so DD-GUI restores only the used parts. Plain `zstd -d` still
+//!   gives the exact raw image. (Format: see image.rs.)
+//! * `--mode=restore`: `--from` is an image, decompressed on the fly and written to `--to`,
+//!   a drive or a file: raw; a DD-GUI smart image (zstd, or gzip from older versions),
+//!   whose free space is skipped on the target; gzip, xz, zstd or zip (its first file
+//!   with anything in it), with a tar inside any of those (its first file); and what
+//!   `formats` reads: bzip2, lz4, lzma, 7z, tar, DMG, VHD, VHDX, VMDK and QCOW2. The
+//!   format comes from the file's content, not its name. A drive counts as raw.
+//! * `--mode=zeros`: writes zeros to `--to` from its start: all of a drive, or `--size`
+//!   bytes, which a file needs (it's created, or emptied first). Drives are written
+//!   unbuffered (O_DIRECT, raw devices, FILE_FLAG_NO_BUFFERING). No `--from`.
 //! * `--ask` (with `--mode=smart` only): after a first analysis (`smart::estimate`, as
-//!   file systems may still be mounted), print `@layout <json>` and wait for an answer line. "smart" continues. "full" runs the bundled dd with
-//!   DD_OPERANDS instead, sector by sector, reporting like `DD-GUI dd`. Anything else,
-//!   or EOF, cancels (exit 130). The answer comes on stdin (with `--ddgui-watch-stdin`,
-//!   where a later EOF still means cancel) or through `--ddgui-answer-file`.
+//!   file systems may still be mounted), print `@layout <json>` and wait for an answer
+//!   line. "smart" continues. "full" runs the bundled dd with DD_OPERANDS instead, sector
+//!   by sector, reporting like `dd-gui dd`. Anything else, or EOF, cancels (exit 130).
+//!   The answer comes on stdin (with `--ddgui-watch-stdin`, where a later EOF still means
+//!   cancel) or through `--ddgui-answer-file`.
 //! * `--block-size=N`: bytes per read and write (default 4 MiB; `K`, `M`, `G` suffixes;
 //!   a multiple of 4096). Smart images always compress 4 MiB at a time.
+//! * `--size=N` (with `--mode=zeros` only): bytes to write (`K`, `M`, `G`, `T` suffixes
+//!   work too). Needn't be a multiple of anything.
+//!
+//! Drives, in every mode, are read and written unbuffered where the OS allows it (O_DIRECT
+//! on Linux, /dev/rdiskN on macOS, FILE_FLAG_NO_BUFFERING and FILE_FLAG_WRITE_THROUGH on
+//! Windows), so the progress follows the drive. Every transfer is whole logical sectors at
+//! sector offsets; a partial sector is read, patched and written back (see disk.rs).
 //!
 //! Order: `@ready` → [analysis → `@layout` → answer] → unmount and lock (PLUMBING) →
-//! `@copy` → smart: analyze again, now unmounted → `@total` → `@progress`… → `@sync` → exit 0.
-//! `@sync` flushes `--to`, then `--ddgui-sync`'s drive. The last `@progress` comes before it.
+//! `@copy` → smart: analyze again, now unmounted → [`@total`] → `@progress`… → `@sync` →
+//! exit 0. `@sync` flushes `--to`, then `--ddgui-sync`'s drive. The last `@progress`
+//! comes before it.
 //!
 //! Lines on stdout with `--ddgui-worker`:
 //!
@@ -39,13 +57,21 @@
 //! | `@ready` | the worker runs (any password prompt is over) |
 //! | `@layout {json}` | `smart::Layout` as JSON, only with `--ask` |
 //! | `@copy` | drives are unmounted, copying starts |
-//! | `@total N` | what the progress counts toward |
-//! | `@progress DONE WRITTEN` | about every 0.5 s: DONE in units of `@total`, WRITTEN = bytes written to `--to` |
+//! | `@total N` | what DONE counts toward; not sent when that isn't known upfront |
+//! | `@progress DONE WRITTEN` | about every 0.5 s: DONE in the units below (never past `@total`), WRITTEN = bytes written to `--to` |
 //! | `@sync` | flushing the target |
 //!
-//! Progress units: smart copies, and restores of smart images, count used bytes. Restores
-//! of other compressed images count compressed bytes read, since their full size isn't known
-//! upfront. Raw restores count bytes.
+//! Progress units, for DONE and `@total`:
+//!
+//! * smart copies, and restores of smart images: used bytes (DONE = bytes of used data
+//!   copied; WRITTEN is the image's size so far when writing a smart image);
+//! * raw restores, and zeros: bytes (DONE = WRITTEN);
+//! * restores of gzip, xz, zstd and zip images: compressed bytes read, out of the
+//!   file's size, as the size once decompressed often isn't known upfront;
+//! * restores of the formats from `formats` (bzip2, lz4, lzma, 7z, tar, virtual disks):
+//!   bytes of the raw disk written (DONE = WRITTEN), out of the raw disk's size. When the
+//!   format doesn't tell that size upfront (a .bz2, say), there's no `@total` line: the
+//!   GUI can only show the bytes written.
 //!
 //! Errors: `dd-gui: <message>` lines on stderr and a non-zero exit code.
 
@@ -100,16 +126,20 @@ pub fn main() -> i32 {
 enum Mode {
     Smart,
     Restore,
+    Zeros,
 }
 
 #[derive(Debug)]
 struct Args {
     plumbing: Plumbing,
     mode: Mode,
+    /// Empty for zeros.
     from: PathBuf,
     to: PathBuf,
     ask: bool,
     block_size: usize,
+    /// Bytes of zeros.
+    size: Option<u64>,
     /// dd's operands, for a full copy after `--ask`.
     dd: Vec<OsString>,
 }
@@ -117,8 +147,8 @@ struct Args {
 impl Args {
     fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Args, String> {
         let mut plumbing = Plumbing::default();
-        let (mut mode, mut from, mut to, mut ask, mut block_size, mut dd) =
-            (None, None, None, false, 4 << 20, vec![]);
+        let (mut mode, mut from, mut to, mut ask, mut block_size, mut size, mut dd) =
+            (None, None, None, false, 4 << 20, None, vec![]);
         while let Some(arg) = args.next() {
             if arg == "--" {
                 dd = args.collect();
@@ -138,8 +168,11 @@ impl Args {
                     mode = Some(match text() {
                         "smart" => Mode::Smart,
                         "restore" => Mode::Restore,
+                        "zeros" => Mode::Zeros,
                         other => {
-                            return Err(format!("unknown mode \"{other}\" (use smart or restore)"));
+                            return Err(format!(
+                                "unknown mode \"{other}\" (use smart, restore or zeros)"
+                            ));
                         }
                     })
                 }
@@ -148,8 +181,12 @@ impl Args {
                 "--ask" => ask = true,
                 "--block-size" => {
                     block_size = parse_size(text())
-                        .filter(|&n| n % disk::ALIGN == 0 && (disk::ALIGN..=256 << 20).contains(&n))
-                        .ok_or("--block-size has to be a multiple of 4096 between 4K and 256M")?;
+                        .filter(|&n| n % disk::ALIGN as u64 == 0 && (4096..=256 << 20).contains(&n))
+                        .ok_or("--block-size has to be a multiple of 4096 between 4K and 256M")?
+                        as usize;
+                }
+                "--size" => {
+                    size = Some(parse_size(text()).ok_or("--size has to be a number of bytes")?)
                 }
                 _ if name.starts_with("--ddgui-") => {
                     plumbing.parse(arg.to_str().ok_or("invalid option")?)?
@@ -158,14 +195,22 @@ impl Args {
             }
         }
         let mode = mode.ok_or("--mode is missing")?;
-        let from = from
-            .filter(|p| !p.as_os_str().is_empty())
-            .ok_or("--from is missing")?;
+        let from = from.filter(|p| !p.as_os_str().is_empty());
+        let from = match mode {
+            Mode::Zeros if from.is_some() => {
+                return Err("--from doesn't go with --mode=zeros".into());
+            }
+            Mode::Zeros => PathBuf::new(),
+            _ => from.ok_or("--from is missing")?,
+        };
         let to = to
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or("--to is missing")?;
         if ask && mode != Mode::Smart {
             return Err("--ask only goes with --mode=smart".into());
+        }
+        if size.is_some() && mode != Mode::Zeros {
+            return Err("--size only goes with --mode=zeros".into());
         }
         Ok(Args {
             plumbing,
@@ -174,6 +219,7 @@ impl Args {
             to,
             ask,
             block_size,
+            size,
             dd,
         })
     }
@@ -186,23 +232,24 @@ impl Args {
     }
 }
 
-/// "4194304", "4M", "512K", "1G" → bytes.
-fn parse_size(text: &str) -> Option<usize> {
+/// "4194304", "4M", "512K", "1G", "2T" → bytes.
+fn parse_size(text: &str) -> Option<u64> {
     let digits = text
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(text.len());
-    let unit = match &text[digits..] {
+    let unit: u64 = match &text[digits..] {
         "" => 1,
         "K" | "k" | "KiB" => 1 << 10,
         "M" | "MiB" => 1 << 20,
         "G" | "GiB" => 1 << 30,
+        "T" | "TiB" => 1 << 40,
         _ => return None,
     };
-    text[..digits].parse::<usize>().ok()?.checked_mul(unit)
+    text[..digits].parse::<u64>().ok()?.checked_mul(unit)
 }
 
 fn run(args: &Args, answers: Option<Receiver<String>>) -> Result<i32, String> {
-    if same_file(&args.from, &args.to) {
+    if args.mode != Mode::Zeros && same_file(&args.from, &args.to) {
         return Err("--from and --to are the same".into());
     }
     if let Some(answers) = answers {
@@ -231,6 +278,7 @@ fn run(args: &Args, answers: Option<Receiver<String>>) -> Result<i32, String> {
     let target = match args.mode {
         Mode::Smart => smart_copy(args)?,
         Mode::Restore => restore(args)?,
+        Mode::Zeros => zeros(args)?,
     };
     args.say("sync");
     target
@@ -265,21 +313,23 @@ fn smart_copy(args: &Args) -> Result<Disk, String> {
             ));
         }
         args.say(&format!("total {}", map.used()));
-        let _reporter = Reporter::start(progress.clone(), map.used(), args.plumbing.worker);
+        let _reporter = Reporter::start(progress.clone(), Some(map.used()), args.plumbing.worker);
         copy::to_drive(&src, &dst, &map.extents, args.block_size, &progress)?;
         Ok(dst)
     } else {
         let dst = Disk::create(&args.to)
             .map_err(|e| format!("couldn't create {}: {}", args.to.display(), why(&e)))?;
         args.say(&format!("total {}", map.used()));
-        let _reporter = Reporter::start(progress.clone(), map.used(), args.plumbing.worker);
+        let _reporter = Reporter::start(progress.clone(), Some(map.used()), args.plumbing.worker);
         copy::to_image(&src, &map, &dst, &progress)?;
         Ok(dst)
     }
 }
 
 fn restore(args: &Args) -> Result<Disk, String> {
-    let image = restore::inspect(&args.from).map_err(|e| open_error(&args.from, &e))?;
+    let mut image = restore::inspect(&args.from).map_err(|e| open_error(&args.from, &e))?;
+    // Formats from `formats` open now: that may tell the raw disk's size, for the total.
+    image.open().map_err(|e| open_error(&args.from, &e))?;
     let dst = if disk::is_drive(&args.to) {
         Disk::open_drive(&args.to).map_err(|e| open_error(&args.to, &e))?
     } else {
@@ -298,13 +348,44 @@ fn restore(args: &Args) -> Result<Disk, String> {
         ));
     }
     let progress = Arc::new(Progress::default());
-    args.say(&format!("total {}", image.total()));
-    let _reporter = Reporter::start(progress.clone(), image.total(), args.plumbing.worker);
-    restore::restore(&image, &dst, args.block_size, &progress)?;
+    let total = image.total();
+    if let Some(total) = total {
+        args.say(&format!("total {total}"));
+    }
+    let _reporter = Reporter::start(progress.clone(), total, args.plumbing.worker);
+    restore::restore(&mut image, &dst, args.block_size, &progress)?;
     Ok(dst)
 }
 
-/// The answer was "full": the bundled dd copies everything, reporting as `DD-GUI dd`
+fn zeros(args: &Args) -> Result<Disk, String> {
+    let (dst, size) = if disk::is_drive(&args.to) {
+        let dst = Disk::open_drive(&args.to).map_err(|e| open_error(&args.to, &e))?;
+        let size = args.size.unwrap_or(dst.size);
+        if size > dst.size {
+            return Err(format!(
+                "{} is too small: it holds {}, not {}.",
+                args.to.display(),
+                fmt::bytes(dst.size),
+                fmt::bytes(size)
+            ));
+        }
+        (dst, size)
+    } else {
+        let size = args
+            .size
+            .ok_or("--size is needed to write zeros to a file")?;
+        let dst = Disk::create(&args.to)
+            .map_err(|e| format!("couldn't create {}: {}", args.to.display(), why(&e)))?;
+        (dst, size)
+    };
+    let progress = Arc::new(Progress::default());
+    args.say(&format!("total {size}"));
+    let _reporter = Reporter::start(progress.clone(), Some(size), args.plumbing.worker);
+    copy::zeros(&dst, size, args.block_size, &progress)?;
+    Ok(dst)
+}
+
+/// The answer was "full": the bundled dd copies everything, reporting as `dd-gui dd`
 /// does (its progress and messages go straight to our stderr).
 fn full_copy(args: &Args) -> Result<i32, String> {
     if args.dd.is_empty() {
@@ -438,7 +519,8 @@ pub struct ImageInfo {
     pub format: ImageFormat,
     /// Size of the file itself.
     pub size: u64,
-    /// Size once decompressed, when the format tells.
+    /// Size once decompressed, when the format tells. For a tar inside gzip, xz, zstd or
+    /// zip: the size of the file in the tar that gets restored.
     pub uncompressed: Option<u64>,
     pub smart: Option<SmartInfo>,
 }
@@ -446,7 +528,9 @@ pub struct ImageInfo {
 /// Looks at an image file without reading all of it (fast, no privileges needed).
 ///
 /// `uncompressed` is known for raw images, smart images (their map), xz (its index),
-/// zstd (when the first frame's header has it) and zip (its first file's entry).
+/// zstd (a seek table, or a size in the first frame's header), zip (its first file's
+/// entry), a tar inside any of those (its first file's header), and whatever `formats`
+/// learns cheaply (virtual disks record it).
 pub fn probe(path: &Path) -> io::Result<ImageInfo> {
     restore::inspect(path).map(|image| image.info)
 }

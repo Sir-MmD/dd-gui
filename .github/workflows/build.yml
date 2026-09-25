@@ -5,8 +5,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
+    name: ${{ matrix.artifact }}
     strategy:
       fail-fast: false
       matrix:
@@ -15,7 +22,7 @@ jobs:
           - os: ubuntu-22.04
             artifact: dd-gui-linux-x86_64
             path: target/release/dd-gui
-          # build.rs embeds the icon and version info here (rc.exe comes with the Windows SDK).
+          # MSVC: build.rs embeds the icon and version info with rc.exe from the Windows SDK.
           - os: windows-latest
             artifact: dd-gui-windows-x86_64
             path: target/release/dd-gui.exe
@@ -29,16 +36,31 @@ jobs:
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-      - run: cargo test --release
-      - run: cargo build --release
 
-      - name: Check the exe's version info
+      # zstd-sys compiles libzstd's C with the runner's own compiler (gcc, clang or MSVC).
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+
+      - name: Check dd-gui.exe's icon, version info and manifest
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $info = (Get-Item target/release/dd-gui.exe).VersionInfo
-          $info | Format-List ProductName, FileDescription, ProductVersion, FileVersion
-          if ($info.ProductName -ne 'DD-GUI') { throw 'dd-gui.exe is missing its icon and version info' }
+          $exe = (Resolve-Path target/release/dd-gui.exe).Path
+          # What Explorer shows in Properties > Details.
+          $info = (Get-Item $exe).VersionInfo
+          $info | Format-List ProductName, FileDescription, InternalName, OriginalFilename, ProductVersion, FileVersion
+          if ($info.ProductName -ne 'DD-GUI') { throw 'dd-gui.exe is missing its version info' }
+          if ($info.OriginalFilename -ne 'dd-gui.exe') { throw "OriginalFilename is '$($info.OriginalFilename)'" }
+          # The icon, as the shell finds it.
+          Add-Type -Namespace Win32 -Name Shell -MemberDefinition '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);'
+          $icons = [Win32.Shell]::ExtractIconEx($exe, -1, $null, $null, 0)
+          "icons in dd-gui.exe: $icons"
+          if ($icons -lt 1) { throw 'dd-gui.exe has no icon' }
+          # Every size of assets/dd-gui.ico, the version strings, exactly one manifest.
+          python packaging/windows/check-exe.py $exe
+          if ($LASTEXITCODE -ne 0) { throw 'dd-gui.exe failed packaging/windows/check-exe.py' }
 
       - name: Bundle DD-GUI.app
         if: runner.os == 'macOS'
@@ -50,11 +72,16 @@ jobs:
           rm -rf "$app"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp target/release/dd-gui "$app/Contents/MacOS/dd-gui"
-          cp assets/DD-GUI.icns "$app/Contents/Resources/DD-GUI.icns"
+          cp assets/dd-gui.icns "$app/Contents/Resources/dd-gui.icns"
           sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
           plutil -lint "$app/Contents/Info.plist"
+          # Info.plist has to name the files that are there.
+          plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$app/Contents/Info.plist"; }
+          test -x "$app/Contents/MacOS/$(plist CFBundleExecutable)"
+          test -f "$app/Contents/Resources/$(plist CFBundleIconFile).icns"
           # Ad-hoc signature over the whole bundle, so macOS doesn't call the download "damaged".
           codesign --force --sign - "$app"
+          codesign --verify --strict --verbose=2 "$app"
           # ditto keeps the executable bit and the signature; upload-artifact's own zip would not.
           ditto -c -k --keepParent "$app" target/release/DD-GUI-macos-arm64.zip
 
@@ -63,3 +90,52 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
           if-no-files-found: error
+
+      # End-to-end tests run the release binary for real, as root / administrator. Each
+      # script gets the binary's absolute path as its first argument and in DD_GUI, and
+      # runs from the repository root. They're skipped while the scripts don't exist.
+      - name: End-to-end tests (Linux)
+        if: runner.os == 'Linux' && hashFiles('ci/e2e-linux.sh') != ''
+        timeout-minutes: 30
+        env:
+          DD_GUI: ${{ github.workspace }}/target/release/dd-gui
+        run: sudo DD_GUI="$DD_GUI" bash ci/e2e-linux.sh "$DD_GUI"
+
+      - name: End-to-end tests (macOS)
+        if: runner.os == 'macOS' && hashFiles('ci/e2e-macos.sh') != ''
+        timeout-minutes: 30
+        env:
+          # The binary as shipped: inside the signed bundle.
+          DD_GUI: ${{ github.workspace }}/target/release/DD-GUI.app/Contents/MacOS/dd-gui
+        # The runner's bash (not necessarily macOS's old /bin/bash), as root.
+        run: sudo DD_GUI="$DD_GUI" "$(command -v bash)" ci/e2e-macos.sh "$DD_GUI"
+
+      - name: End-to-end tests (Windows)
+        if: runner.os == 'Windows' && hashFiles('ci/e2e-windows.ps1') != ''
+        timeout-minutes: 30
+        shell: pwsh
+        env:
+          DD_GUI: ${{ github.workspace }}\target\release\dd-gui.exe
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ci/e2e-windows.ps1 $env:DD_GUI
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # dd-gui.exe cross-built from Linux with MinGW, so that keeps working (build.rs embeds the
+  # icon with x86_64-w64-mingw32-windres there). The release exe is the MSVC one above.
+  windows-gnu-cross:
+    name: dd-gui.exe cross-built on Linux (MinGW)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Build
+        env:
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: Check dd-gui.exe's icon, version info and manifest
+        run: python3 packaging/windows/check-exe.py target/x86_64-pc-windows-gnu/release/dd-gui.exe

@@ -12,8 +12,11 @@
 //! * `--ddgui-answer-file=PATH`  `copy --ask` only: the answer, once PATH appears
 //! * `--ddgui-parent=PID`        quit once process PID is gone
 //! * `--ddgui-unmount=DEV`       unmount DEV before copying (repeatable)
-//! * `--ddgui-lock=X:`           lock and dismount volume X: before copying (Windows)
-//! * `--ddgui-sync=DEV`          flush DEV to the hardware after dd succeeds
+//! * `--ddgui-lock=VOLUME`       lock and dismount a volume before copying, and keep it so
+//!   until the end (Windows): `X:`, or `\\?\Volume{GUID}` for one without a drive letter.
+//!   A volume that no longer exists is skipped.
+//! * `--ddgui-sync=DEV`          flush DEV to the hardware after dd succeeds (Windows also
+//!   re-reads its partition table then)
 
 use std::ffi::OsString;
 use std::io::{BufRead, Read, Write};
@@ -131,7 +134,9 @@ impl Plumbing {
         let mut held: Held = Vec::new();
         #[cfg(windows)]
         for volume in &self.lock {
-            held.push(Box::new(win::lock_and_dismount(volume)?));
+            if let Some(lock) = win::lock_and_dismount(volume)? {
+                held.push(Box::new(lock));
+            }
         }
         #[cfg(not(windows))]
         if !self.lock.is_empty() {
@@ -144,23 +149,41 @@ impl Plumbing {
     pub fn flush(&self) -> Result<(), String> {
         let Some(dev) = &self.sync else { return Ok(()) };
         // Windows' FlushFileBuffers needs write access (this never creates or truncates).
-        std::fs::OpenOptions::new()
+        let _drive = std::fs::OpenOptions::new()
             .read(true)
             .write(cfg!(windows))
             .open(dev)
-            .and_then(|f| sync(&f))
-            .map_err(|err| format!("couldn't flush {}: {err}", dev.display()))
+            .and_then(|f| sync(&f).map(|()| f))
+            .map_err(|err| {
+                format!(
+                    "couldn't flush {}: {}",
+                    dev.display(),
+                    crate::engine::why(&err)
+                )
+            })?;
+        // Windows only reads a drive's partition table now and then: have it read the new
+        // one, so the volumes on it show up once our locks go (as Rufus does).
+        #[cfg(windows)]
+        win::update_properties(&_drive);
+        Ok(())
     }
 }
 
 /// Flushes what was written to a drive or file all the way to the hardware. (fsync on a
-/// Linux block device also flushes the drive's own write cache.)
+/// Linux block device also flushes the drive's own write cache; FlushFileBuffers on a
+/// Windows drive does too.)
 pub fn sync(file: &std::fs::File) -> std::io::Result<()> {
     let result = file.sync_all();
     #[cfg(target_os = "macos")]
-    if result.is_err() {
+    if let Err(err) = &result
+        && matches!(
+            err.raw_os_error(),
+            Some(libc::ENOTTY | libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL)
+        )
+    {
         // sync_all() is F_FULLFSYNC, which file systems implement but raw devices
-        // (/dev/rdiskN) may not. Then: plain fsync, and ask the drive to empty its cache.
+        // (/dev/rdiskN) don't. Then: plain fsync, and ask the drive to empty its cache.
+        // (Real I/O errors still count.)
         use std::os::unix::io::AsRawFd;
         const DKIOCSYNCHRONIZECACHE: libc::c_ulong = 0x2000_6416; // _IO('d', 22)
         // SAFETY: calls on our own descriptor; this ioctl takes no argument.
@@ -168,6 +191,7 @@ pub fn sync(file: &std::fs::File) -> std::io::Result<()> {
             if libc::fsync(file.as_raw_fd()) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Files (on file systems without F_FULLFSYNC) say ENOTTY here; that's fine.
             libc::ioctl(file.as_raw_fd(), DKIOCSYNCHRONIZECACHE);
         }
         return Ok(());
@@ -360,6 +384,9 @@ mod win {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_WRITE_PROTECT,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
@@ -367,7 +394,9 @@ mod win {
         ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
-    use windows_sys::Win32::System::Ioctl::{FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME};
+    use windows_sys::Win32::System::Ioctl::{
+        FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, IOCTL_DISK_UPDATE_PROPERTIES,
+    };
 
     /// The GUI build has no console; when run as `DD-GUI dd …` from a terminal,
     /// borrow the terminal's console so dd's output shows up.
@@ -409,50 +438,88 @@ mod win {
     }
 
     /// Windows refuses raw writes over a mounted volume, so lock and dismount it first.
-    pub fn lock_and_dismount(volume: &str) -> Result<VolumeLock, String> {
+    /// The lock holds until dropped; Windows would mount the volume again after that. A
+    /// volume that's gone already (the drive letter is free) needs nothing: None.
+    pub fn lock_and_dismount(volume: &str) -> Result<Option<VolumeLock>, String> {
+        let why = |err: std::io::Error| crate::engine::why(&err);
+        // "E:", or a volume's own path (`\\?\Volume{…}`, for volumes without a letter).
+        // Without a trailing backslash, that opens the volume rather than its root folder.
         let name = volume.trim_end_matches('\\');
-        let path: Vec<u16> = format!(r"\\.\{name}").encode_utf16().chain([0]).collect();
-        // SAFETY: `path` is NUL-terminated and outlives the call.
-        let handle = unsafe {
-            CreateFileW(
-                path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            )
+        let path = if name.starts_with(r"\\") {
+            name.to_owned()
+        } else {
+            format!(r"\\.\{name}")
         };
+        let path: Vec<u16> = path.encode_utf16().chain([0]).collect();
+        let open = |access| {
+            // SAFETY: `path` is NUL-terminated and outlives the call.
+            unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        let mut handle = open(GENERIC_READ | GENERIC_WRITE);
+        // Write-protected media (a locked SD card being backed up, say) only open for
+        // reading, which is all a lock needs.
         if handle == INVALID_HANDLE_VALUE {
-            return Err(format!(
-                "couldn't open volume {name}: {}",
-                std::io::Error::last_os_error()
-            ));
+            let code = std::io::Error::last_os_error().raw_os_error();
+            if code == Some(ERROR_WRITE_PROTECT as i32) || code == Some(ERROR_ACCESS_DENIED as i32)
+            {
+                handle = open(GENERIC_READ);
+            }
+        }
+        if handle == INVALID_HANDLE_VALUE {
+            let err = std::io::Error::last_os_error();
+            let gone = [ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND];
+            if gone
+                .iter()
+                .any(|&code| err.raw_os_error() == Some(code as i32))
+            {
+                return Ok(None);
+            }
+            return Err(format!("couldn't open volume {name} ({})", why(err)));
         }
         let lock = VolumeLock(handle);
         // Another program may be holding files open for a moment, so retry a bit.
-        let mut locked = false;
+        let mut failure = None;
         for _ in 0..20 {
             if ioctl(handle, FSCTL_LOCK_VOLUME) {
-                locked = true;
+                failure = None;
                 break;
             }
+            failure = Some(std::io::Error::last_os_error());
             std::thread::sleep(Duration::from_millis(250));
         }
-        if !locked {
+        if let Some(err) = failure {
             return Err(format!(
                 "couldn't lock volume {name} ({}). Close any programs using it and try again.",
-                std::io::Error::last_os_error()
+                why(err)
             ));
         }
         if !ioctl(handle, FSCTL_DISMOUNT_VOLUME) {
             return Err(format!(
-                "couldn't dismount volume {name}: {}",
-                std::io::Error::last_os_error()
+                "couldn't dismount volume {name} ({})",
+                why(std::io::Error::last_os_error())
             ));
         }
-        Ok(lock)
+        Ok(Some(lock))
+    }
+
+    /// Has Windows read the drive's partition table again. Best effort: a drive that
+    /// doesn't take it keeps the old view until it's plugged in again.
+    pub fn update_properties(drive: &std::fs::File) {
+        use std::os::windows::io::AsRawHandle;
+        ioctl(
+            drive.as_raw_handle() as HANDLE,
+            IOCTL_DISK_UPDATE_PROPERTIES,
+        );
     }
 }
 

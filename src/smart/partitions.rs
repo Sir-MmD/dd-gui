@@ -1,9 +1,26 @@
-//! Partition tables: MBR (with logical partitions in extended ones), GPT, or none at all.
+//! Partition tables: MBR (with logical partitions in extended ones, and BSD disklabels in
+//! BSD slices), GPT, Apple partition maps, or none at all.
+//!
+//! Partitions are numbered the way Linux numbers them:
+//! - GPT: by entry, from 1.
+//! - MBR: primary partitions 1 to 4, logical partitions from 5 on (in chain order).
+//! - BSD disklabels (in MBR partitions of type 0xA5 FreeBSD, 0xA6 OpenBSD, 0xA9 NetBSD):
+//!   their partitions come after the logical ones, in label order. The slice itself isn't
+//!   looked into then: what no BSD partition covers is free, except its boot area and label.
+//! - Apple partition maps: by map entry, from 1 (the map itself is usually 1). Only
+//!   entries that hold data are listed: free space (Apple_Free) is skipped, and the map and
+//!   the drivers are copied as they are.
+//!
+//! Like Linux, a GPT (or else an MBR) takes precedence over an Apple partition map on the
+//! same drive, as on hybrid CD images. The map's partitions are then copied as they are.
 
 use super::probe;
-use super::util::{Disk, at, crc32, u32_at, u64_at};
+use super::util::{Disk, at, be16_at, be32_at, crc32, u16_at, u32_at, u64_at};
 use super::{Extent, Table};
 use std::io;
+
+/// How an Apple partition map shows in `Layout::table`.
+pub(crate) const APM: Table = Table::Apm;
 
 /// A partition to look into.
 pub(crate) struct Slot {
@@ -107,26 +124,37 @@ pub(crate) fn read(disk: &mut Disk) -> io::Result<Scheme> {
 fn scan(disk: &mut Disk, head: &[u8]) -> io::Result<Scheme> {
     let size = disk.size();
     let Some(mbr) = head.get(..512) else { return Ok(Scheme::floppy(size)) };
+    let apm = apple_map(disk, head);
     let signed = at(mbr, 510, &[0x55, 0xAA]);
     let e = entries(mbr);
     // Without a valid GPT after all, the 0xEE entry is copied in full as an unknown partition.
     if signed
         && e.iter().any(|x| x.kind == 0xEE)
-        && let Some(gpt) = gpt(disk, &e)
+        && let Some(mut gpt) = gpt(disk, &e)
     {
+        if let Some(apm) = &apm {
+            apm.keep(&mut gpt);
+        }
         return Ok(gpt);
     }
     let valid = signed && e.iter().all(|x| x.boot == 0 || x.boot == 0x80);
     let partitions = valid && e.iter().any(|x| x.used() && x.start.checked_mul(512).is_some_and(|p| p < size));
     let boot_sector = probe::boot_sector(mbr).is_some();
-    Ok(match (boot_sector, partitions) {
-        (true, true) => {
+    Ok(match (boot_sector, partitions, apm) {
+        (true, true, _) => {
             let mut scheme = Scheme::floppy(size);
             scheme.whole = Some("both a boot sector and a partition table");
             scheme
         }
-        (false, true) => mbr_table(disk, &e),
-        (false, false) if valid && probe::detect(head).is_empty() => Scheme::new(Table::Mbr),
+        (false, true, apm) => {
+            let mut scheme = mbr_table(disk, &e);
+            if let Some(apm) = apm {
+                apm.keep(&mut scheme);
+            }
+            scheme
+        }
+        (_, false, Some(apm)) => apm.scheme(),
+        (false, false, None) if valid && probe::detect(head).is_empty() => Scheme::new(Table::Mbr),
         _ => Scheme::floppy(size),
     })
 }
@@ -136,15 +164,22 @@ fn mbr_table(disk: &mut Disk, e: &[Entry; 4]) -> Scheme {
     let (ss, unsure) = sector_size(disk, e);
     let mut scheme = Scheme::new(Table::Mbr);
     let mut next = 5;
+    let mut labels = Vec::new();
     for (i, x) in e.iter().enumerate().filter(|(_, x)| x.used()) {
         let Some((start, len)) = x.bytes(x.start, ss, size) else { continue };
         if x.extended() {
             logical(disk, x, ss, &mut scheme, &mut next);
+        } else if let Some(label) = bsd_label(disk, x, ss) {
+            labels.push(label);
         } else {
             scheme.slots.push(Slot { index: i as u32 + 1, start, size: len });
         }
     }
-    // Like Linux lists them: primary partitions, then logical ones.
+    // BSD partitions are numbered after the logical ones.
+    for label in labels {
+        label.add(&mut scheme, &mut next);
+    }
+    // Like Linux lists them: primary partitions, then logical ones, then BSD ones.
     scheme.slots.sort_by_key(|s| s.index);
     if unsure {
         // Nothing recognisable either way: this may be a drive with 4096-byte sectors, so
@@ -180,7 +215,8 @@ fn evidence(disk: &mut Disk, e: &[Entry; 4], ss: u64) -> usize {
         let Some((pos, len)) = x.bytes(x.start, ss, size) else { continue };
         let len = len.min(if x.extended() { 512 } else { probe::HEAD as u64 }) as usize;
         let Ok(head) = disk.read_vec(pos, len) else { continue };
-        if (x.extended() && at(&head, 510, &[0x55, 0xAA])) || (!x.extended() && !probe::detect(&head).is_empty()) {
+        let fs = !probe::detect(&head).is_empty() || (bsd_flavour(x.kind).is_some() && bsd_magic(&head, ss).is_some());
+        if (x.extended() && at(&head, 510, &[0x55, 0xAA])) || (!x.extended() && fs) {
             found += 1;
         }
     }
@@ -320,4 +356,249 @@ fn gpt(disk: &mut Disk, mbr: &[Entry; 4]) -> Option<Scheme> {
         }
     }
     Some(scheme)
+}
+
+// Apple partition maps.
+
+/// Map entries read at most.
+const MAX_APM_ENTRIES: u64 = 256;
+
+/// What an Apple partition map entry holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApmKind {
+    /// Apple_Free: nothing.
+    Free,
+    /// The map itself, and drivers: copied as they are.
+    Kept,
+    /// A partition to look into.
+    Data,
+}
+
+struct ApmEntry {
+    index: u32,
+    start: u64,
+    size: u64,
+    kind: ApmKind,
+}
+
+struct AppleMap {
+    entries: Vec<ApmEntry>,
+    /// Block 0, the map's entries, and the drivers block 0 lists.
+    fixed: Vec<Extent>,
+}
+
+/// An Apple partition map: a driver descriptor ("ER") in block 0 with the block size (512,
+/// or 2048 on CDs), then map entries ("PM") in blocks 1 to N, N being in every entry. Like
+/// Linux, the map ends early at the first block that isn't an entry.
+fn apple_map(disk: &mut Disk, head: &[u8]) -> Option<AppleMap> {
+    let size = disk.size();
+    let bs = u64::from(be16_at(head, 2));
+    if !at(head, 0, b"ER") || !matches!(bs, 512 | 1024 | 2048 | 4096) {
+        return None;
+    }
+    let mut entry = [0u8; 512];
+    disk.read_at(bs, &mut entry).ok()?;
+    let count = u64::from(be32_at(&entry, 4));
+    if !at(&entry, 0, b"PM") || !(1..=MAX_APM_ENTRIES).contains(&count) {
+        return None;
+    }
+    let mut map = AppleMap { entries: Vec::new(), fixed: vec![Extent { start: 0, len: bs }] };
+    for slot in 1..=count {
+        let pos = slot * bs;
+        if pos + 512 > size || disk.read_at(pos, &mut entry).is_err() || !at(&entry, 0, b"PM") {
+            break;
+        }
+        map.fixed.push(Extent { start: pos, len: bs });
+        let (first, blocks) = (u64::from(be32_at(&entry, 8)), u64::from(be32_at(&entry, 12)));
+        let Some(start) = first.checked_mul(bs).filter(|&start| start < size) else { continue };
+        let end = first.saturating_add(blocks).saturating_mul(bs).min(size);
+        if end > start {
+            map.entries.push(ApmEntry { index: slot as u32, start, size: end - start, kind: apm_kind(&entry[48..80]) });
+        }
+    }
+    // Drivers, as block 0 lists them: first block, size in 512-byte sectors, type.
+    for i in 0..usize::from(be16_at(head, 16)).min(61) {
+        let (block, sectors) = (u64::from(be32_at(head, 18 + 8 * i)), u64::from(be16_at(head, 22 + 8 * i)));
+        if let Some(start) = block.checked_mul(bs).filter(|&start| start < size) {
+            map.fixed.push(Extent { start, len: (sectors * 512).max(bs).min(size - start) });
+        }
+    }
+    Some(map)
+}
+
+/// By the entry's type (`pmParType`), compared the way Apple does: ignoring case.
+fn apm_kind(kind: &[u8]) -> ApmKind {
+    let name = kind.split(|&c| c == 0).next().unwrap_or_default();
+    let prefix = |p: &str| name.get(..p.len()).is_some_and(|n| n.eq_ignore_ascii_case(p.as_bytes()));
+    let is = |t: &str| name.eq_ignore_ascii_case(t.as_bytes());
+    if is("Apple_Free") {
+        ApmKind::Free
+    } else if is("Apple_partition_map") || prefix("Apple_Driver") || is("Apple_Patches") || is("Apple_FWDriver") {
+        ApmKind::Kept
+    } else {
+        ApmKind::Data
+    }
+}
+
+impl AppleMap {
+    /// The drive's scheme when the map is the only partition table.
+    fn scheme(self) -> Scheme {
+        let mut scheme = Scheme::new(APM);
+        scheme.fixed = self.fixed;
+        for e in self.entries {
+            match e.kind {
+                ApmKind::Free => {}
+                ApmKind::Kept => scheme.fixed.push(Extent { start: e.start, len: e.size }),
+                ApmKind::Data => scheme.slots.push(Slot { index: e.index, start: e.start, size: e.size }),
+            }
+        }
+        scheme
+    }
+
+    /// Next to a GPT or an MBR that's used instead, as on hybrid CD images: the map's
+    /// partitions are kept as they are. Their file systems often share blocks with the
+    /// ones the other table shows, which then can't tell what the others need.
+    fn keep(&self, scheme: &mut Scheme) {
+        scheme.fixed.extend(&self.fixed);
+        let used = self.entries.iter().filter(|e| e.kind != ApmKind::Free);
+        scheme.fixed.extend(used.map(|e| Extent { start: e.start, len: e.size }));
+    }
+}
+
+// BSD disklabels.
+
+const BSD_MAGIC: u32 = 0x8256_4557;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flavour {
+    Free,
+    Open,
+    Net,
+}
+
+/// MBR partition types of BSD slices.
+fn bsd_flavour(kind: u8) -> Option<Flavour> {
+    match kind {
+        0xA5 => Some(Flavour::Free),
+        0xA6 => Some(Flavour::Open),
+        0xA9 => Some(Flavour::Net),
+        _ => None,
+    }
+}
+
+/// Whether a disklabel sits in sector 1 of a slice whose first bytes are `head`: its byte
+/// order then (true for big-endian).
+fn bsd_magic(head: &[u8], ss: u64) -> Option<bool> {
+    let at = usize::try_from(ss).ok()?;
+    let le = u32_at(head, at) == BSD_MAGIC && u32_at(head, at + 132) == BSD_MAGIC;
+    let be = be32_at(head, at) == BSD_MAGIC && be32_at(head, at + 132) == BSD_MAGIC;
+    if le {
+        Some(false)
+    } else if be {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// A disklabel that can be trusted, in bytes on the drive.
+struct BsdLabel {
+    /// The slice's boot code and the label.
+    boot: Extent,
+    /// The partitions Linux lists, in order (empty ones take a number too).
+    listed: Vec<(u64, u64)>,
+    /// Partitions inside the slice that Linux doesn't list (of the "unused" type, or past
+    /// the 8 or 16 it reads): copied as they are.
+    kept: Vec<Extent>,
+}
+
+impl BsdLabel {
+    fn add(self, scheme: &mut Scheme, next: &mut u32) {
+        scheme.fixed.push(self.boot);
+        scheme.fixed.extend(self.kept);
+        for (start, size) in self.listed {
+            if size > 0 {
+                scheme.slots.push(Slot { index: *next, start, size });
+            }
+            *next += 1;
+        }
+    }
+}
+
+/// The disklabel of a BSD slice, when there's one to trust: its magic twice, its checksum,
+/// the slice's sector size, and partitions that are either inside the slice or clear of it.
+/// Offsets are relative to the slice for FreeBSD when the raw partition "c" starts at 0 (as
+/// Linux reads them), absolute otherwise. A file system signature on the slice itself (a
+/// label left over from before) makes it untrustworthy too. None: the slice is looked into
+/// as a partition of its own.
+fn bsd_label(disk: &mut Disk, x: &Entry, ss: u64) -> Option<BsdLabel> {
+    let flavour = bsd_flavour(x.kind)?;
+    let size = disk.size();
+    let (first, sectors) = (x.start, x.sectors);
+    let slice = first.checked_mul(ss).filter(|&start| start < size)?;
+    let slice_len = sectors.saturating_mul(ss).min(size - slice);
+    let head = disk.read_vec(slice, slice_len.min(probe::HEAD as u64) as usize).ok()?;
+    let big = bsd_magic(&head, ss)?;
+    let l = head.get(ss as usize..ss as usize + 512)?;
+    let r16 = |at| if big { be16_at(l, at) } else { u16_at(l, at) };
+    let r32 = |at| u64::from(if big { be32_at(l, at) } else { u32_at(l, at) });
+    let count = usize::from(r16(138));
+    let end = 148 + 16 * count;
+    // The checksum makes the label's 16-bit words XOR to zero, partitions included.
+    let xor = l.get(..end)?.as_chunks::<2>().0.iter().fold(0, |x, &w| x ^ u16::from_le_bytes(w));
+    if count == 0 || xor != 0 || r32(40) != ss {
+        return None;
+    }
+    // OpenBSD keeps high 16 bits of offsets and sizes in version 1 labels.
+    let wide = match (flavour, r16(114)) {
+        (Flavour::Open, 0) => false,
+        (Flavour::Open, 1) => true,
+        (Flavour::Open, _) => return None,
+        _ => false,
+    };
+    let base = if flavour == Flavour::Free && r32(148 + 2 * 16 + 4) == 0 { first } else { 0 };
+    let listed_max = if flavour == Flavour::Open { 16 } else { 8 };
+    let slice_end = first.checked_add(sectors)?;
+    let bytes = |start: u64, len: u64| {
+        let from = start.saturating_mul(ss).min(size);
+        (from, len.saturating_mul(ss).min(size - from))
+    };
+    let mut listed = Vec::new();
+    let mut kept = Vec::new();
+    for i in 0..count {
+        let e = 148 + 16 * i;
+        let high = |at| if wide { u64::from(r16(at)) << 32 } else { 0 };
+        let len = r32(e) | high(e + 10);
+        let start = base.checked_add(r32(e + 4) | high(e + 8))?;
+        let end = start.checked_add(len)?;
+        let raw = start == first && len == sectors;
+        let inside = start >= first && end <= slice_end;
+        if i < listed_max && l[e + 12] != 0 && !raw && inside {
+            listed.push(bytes(start, len));
+        } else if len == 0 || raw || end <= first || start >= slice_end || (start <= first && end >= slice_end) {
+            // Empty, the slice itself, clear of it, or around it (the whole drive).
+        } else if inside {
+            let (start, len) = bytes(start, len);
+            kept.push(Extent { start, len });
+        } else {
+            // Across the slice's edge: the label doesn't add up.
+            return None;
+        }
+    }
+    if !probe::detect(&head).iter().all(|&f| f == probe::Fs::Other("ufs")) || zfs(disk, slice, slice_len) {
+        return None;
+    }
+    let boot = r32(140).clamp(64 << 10, 1 << 20).min(slice_len);
+    Some(BsdLabel { boot: Extent { start: slice, len: boot }, listed, kept })
+}
+
+/// ZFS uberblocks where the first vdev label keeps them (128 to 256 KiB in): ZFS on the
+/// slice itself (or on a BSD partition at its start, which then gets copied in full).
+fn zfs(disk: &mut Disk, start: u64, len: u64) -> bool {
+    const MAGIC: u64 = 0x00BA_B10C;
+    if len < 256 << 10 {
+        return false;
+    }
+    let Ok(ring) = disk.read_vec(start + (128 << 10), 128 << 10) else { return true };
+    ring.as_chunks::<1024>().0.iter().any(|u| u64_at(u, 0) == MAGIC || u64_at(u, 0).swap_bytes() == MAGIC)
 }

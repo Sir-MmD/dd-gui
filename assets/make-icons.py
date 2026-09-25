@@ -6,11 +6,12 @@
 Needs Python 3 (stdlib only), rsvg-convert and ImageMagick 7 (`magick`).
 
 Writes:
-    assets/icon.svg              master, 1024 x 1024 (used for 128 px and up)
+    assets/icon.svg              master, 1024 x 1024 (used for 128 px and up; also the
+                                 window icon, so plain paths only: resvg renders it)
     assets/icon-small.svg        the 32 px version, drawn on the pixel grid
-    assets/png/DD-GUI-<n>.png    16 24 32 48 64 128 256 512 1024
-    assets/DD-GUI.ico            16 24 32 48 64 128 256
-    assets/DD-GUI.icns           16 to 1024, macOS icon grid
+    assets/png/dd-gui-<n>.png    16 24 32 48 64 128 256 512 1024
+    assets/dd-gui.ico            16 24 32 48 64 128 256 (embedded in dd-gui.exe by build.rs)
+    assets/dd-gui.icns           16 to 1024, macOS icon grid (DD-GUI.app)
     ui/logo.svg                  in-app mark, hinted for 30 px
 
 The mark: a lowercase "dd" whose bowls are disk platters (hub, clamp ring)
@@ -293,11 +294,11 @@ def main():
 
     pngs = {}
     for size in (16, 24, 32, 48, 64, 128, 256, 512, 1024):
-        out = os.path.join(png_dir, f"DD-GUI-{size}.png")
+        out = os.path.join(png_dir, f"dd-gui-{size}.png")
         rsvg(hinted_svg(size) if size in HINTED else master, size, out)
         pngs[size] = out
 
-    ico([(s, pngs[s]) for s in (16, 24, 32, 48, 64, 128, 256)], os.path.join(HERE, "DD-GUI.ico"))
+    ico([(s, pngs[s]) for s in (16, 24, 32, 48, 64, 128, 256)], os.path.join(HERE, "dd-gui.ico"))
 
     with tempfile.TemporaryDirectory() as tmp:
         mac = master_svg(inset=100)
@@ -319,7 +320,7 @@ def main():
             ("ic14", m512),       # 256@2x
             ("ic09", m512),       # 512
             ("ic10", m1024),      # 512@2x
-        ], os.path.join(HERE, "DD-GUI.icns"))
+        ], os.path.join(HERE, "dd-gui.icns"))
     print("icons written to", HERE)
 
 

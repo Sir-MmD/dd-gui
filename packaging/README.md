@@ -1,60 +1,97 @@
 # Packaging DD-GUI
 
-DD-GUI is one self-contained binary per OS. The files here make it look at home:
-a menu entry and icons on Linux, an app bundle on macOS. On Windows the icon and
-version info are already inside `DD-GUI.exe`.
+DD-GUI is one self-contained binary per OS, named `dd-gui` (`dd-gui.exe` on Windows);
+"DD-GUI" is only the name people see. The binary carries its own icon everywhere.
 
 ## Linux
 
-Run these from the repository root. They install for your user; for all users, use
-`sudo` and replace `~/.local` with `/usr/local`.
+Nothing to install: put `dd-gui` anywhere and run it (after `chmod +x dd-gui` if it came
+from a CI artifact, whose zip drops the executable bit). There's no AppImage and no
+installer. The binary carries its icons, and each time the GUI starts it puts them and
+a desktop entry in `$XDG_DATA_HOME` (usually `~/.local/share`), so menus, docks and the
+Wayland taskbar show DD-GUI with its icon (`src/desktop.rs`):
 
-```sh
-# the program: target/release/DD-GUI, or the DD-GUI file from the CI artifact.
-# The menu entry runs `DD-GUI`, so it has to be on your PATH.
-install -Dm755 target/release/DD-GUI ~/.local/bin/DD-GUI
-
-# the menu entry
-install -Dm644 packaging/linux/DD-GUI.desktop ~/.local/share/applications/DD-GUI.desktop
-
-# the icons, in the hicolor theme
-for size in 16 24 32 48 64 128 256 512; do
-  install -Dm644 assets/png/DD-GUI-$size.png ~/.local/share/icons/hicolor/${size}x${size}/apps/DD-GUI.png
-done
-install -Dm644 assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/DD-GUI.svg
-
-# optional: most desktops pick the changes up on their own
-gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null
-update-desktop-database ~/.local/share/applications 2>/dev/null
+```
+applications/dd-gui.desktop                  Exec and TryExec: the binary that started
+icons/hicolor/<n>x<n>/apps/dd-gui.png        n = 16 24 32 48 64 128 256 512
+icons/hicolor/scalable/apps/dd-gui.svg
 ```
 
-The window's Wayland app_id and X11 WM_CLASS are both `DD-GUI`, the same as the
-desktop file's name and `StartupWMClass`. That is how docks and task switchers find
-the icon; on Wayland it's the only way. The desktop file also offers DD-GUI for
-`.iso` and `.img` files (Open With).
+- Files are written only when their content differs (through a temporary file and a
+  rename). Moving the binary just updates `Exec` on its next start; while the binary
+  isn't where the entry says, `TryExec` keeps the entry out of menus.
+- After a change it runs `update-desktop-database` on the applications directory, and
+  `gtk-update-icon-cache` if the user's hicolor directory already has an icon cache.
+  Both run in the background, and only if they're installed.
+- Nothing happens when it runs as root, or with `DD_GUI_NO_DESKTOP_INTEGRATION` set.
+  To remove DD-GUI, set that and delete the files above.
 
-To remove it, delete the same files.
+The window's Wayland app_id and X11 WM_CLASS are both `dd-gui`, the same as the desktop
+entry's name and `StartupWMClass`. That is how docks and task switchers find the icon;
+on Wayland it's the only way. The entry also offers DD-GUI for disk images (Open With):
+ISO, raw, compressed (gz, xz, zst, bz2, lz4, lzma, zip, 7z) and virtual disks (DMG,
+VHD, VHDX, VMDK, qcow2).
+
+### System-wide
+
+`linux/dd-gui.desktop` is the same entry for a system-wide install, with `dd-gui` found
+through `PATH`. It's also the template for the entry the binary writes. For example:
+
+```sh
+sudo install -Dm755 target/release/dd-gui /usr/local/bin/dd-gui
+sudo install -Dm644 packaging/linux/dd-gui.desktop /usr/local/share/applications/dd-gui.desktop
+for size in 16 24 32 48 64 128 256 512; do
+  sudo install -Dm644 assets/png/dd-gui-$size.png /usr/local/share/icons/hicolor/${size}x${size}/apps/dd-gui.png
+done
+sudo install -Dm644 assets/icon.svg /usr/local/share/icons/hicolor/scalable/apps/dd-gui.svg
+```
+
+Users still get their own copy in `~/.local/share` when they start it, pointing at the
+same binary.
 
 ## macOS
 
 CI builds `DD-GUI.app` (see `.github/workflows/build.yml`):
 
 ```
-DD-GUI.app/Contents/Info.plist            packaging/macos/Info.plist, @VERSION@ -> the Cargo.toml version
-DD-GUI.app/Contents/MacOS/DD-GUI          the release binary
-DD-GUI.app/Contents/Resources/DD-GUI.icns assets/DD-GUI.icns
+DD-GUI.app/Contents/Info.plist              packaging/macos/Info.plist, @VERSION@ -> the Cargo.toml version
+DD-GUI.app/Contents/MacOS/dd-gui            the release binary
+DD-GUI.app/Contents/Resources/dd-gui.icns   assets/dd-gui.icns
 ```
 
-The bundle is ad-hoc signed only, so on first launch macOS asks for confirmation:
-right-click the app and choose Open, or run `xattr -dr com.apple.quarantine DD-GUI.app`.
+`CFBundleExecutable` and `CFBundleIconFile` are `dd-gui`, the identifier is
+`io.github.sir-mmd.dd-gui`, and the name shown is DD-GUI. The bundle is ad-hoc signed
+only and zipped with `ditto` (which keeps the signature), so on first launch macOS asks
+for confirmation: right-click the app and choose Open, or run
+`xattr -dr com.apple.quarantine DD-GUI.app`.
 
 ## Windows
 
-`build.rs` embeds `assets/DD-GUI.ico` and the version info (ProductName and
-FileDescription `DD-GUI`, version from Cargo.toml) when the resource compiler is
-available: always on a Windows host with MSVC, which is how CI builds. Cross-builds
-from Linux or macOS need `llvm-rc` (or MinGW's `windres`); without one the exe still
-builds, just without an icon.
+`build.rs` puts into `dd-gui.exe`:
+
+- the icon, `assets/dd-gui.ico` (16 to 256 px);
+- version info: ProductName and FileDescription `DD-GUI`, InternalName `dd-gui`,
+  OriginalFilename `dd-gui.exe`, and the version from Cargo.toml;
+- a manifest (assembly `dd-gui`) asking for administrator rights, since raw disk access
+  needs them.
+
+The icon and version info need a resource compiler: rc.exe from the Windows SDK for
+MSVC builds (how CI builds the release), MinGW's windres for GNU targets, or llvm-rc for
+MSVC targets on other systems. A Windows build without one fails. When cross-compiling
+it fails at the link, so that `cargo check --target …-windows-…` still works, with a
+warning.
+
+Cross-building from Linux with MinGW (CI does this too, to keep it working):
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+sudo apt install gcc-mingw-w64-x86-64     # Arch: pacman -S mingw-w64-gcc
+cargo build --release --target x86_64-pc-windows-gnu
+python3 packaging/windows/check-exe.py target/x86_64-pc-windows-gnu/release/dd-gui.exe
+```
+
+`windows/check-exe.py` checks an exe's icon (every image of `assets/dd-gui.ico`), version
+info and manifest. It needs only Python 3.
 
 ## Icons
 

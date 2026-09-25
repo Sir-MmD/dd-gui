@@ -1,41 +1,78 @@
-//! DD-GUI smart images: a gzip file of a whole drive, where free space is stored as
-//! (very cheap) zeros and the map of used space sits in the first member's header.
+//! DD-GUI smart images: a whole drive in one compressed file, where free space costs next
+//! to nothing and a map of the used space comes first, so DD-GUI can restore just the
+//! used parts. Any zstd (or, for version 1, gzip) decoder still gives the full raw image:
+//! the used data in place, zeros for free space, exactly the drive's size.
 //!
-//! Version 1 is a multi-member gzip file (RFC 1952), so plain `gunzip` gives the raw
-//! image. DD-GUI reads more out of it:
+//! # Version 2: zstd (`.img.zst`), what DD-GUI writes
 //!
-//! * Every member has an FEXTRA subfield `DG` of 8 bytes: the member's size in the
-//!   file, then its uncompressed size, both u32 little-endian. With the map, a restore
-//!   skips members of free space without decompressing them.
-//! * The first member is empty. Its FCOMMENT holds the map, in ASCII:
+//! A zstd file (RFC 8878) in zstd's seekable format [^seekable]: independent frames, then
+//! a seek table, so DD-GUI jumps over free space without decompressing it (and tools that
+//! know the format can read any part of the image). Integers are little-endian.
 //!
-//!   ```text
-//!   DD-GUI smart image v1
-//!   size=<drive bytes> used=<bytes in extents> extents=<count> unit=<4096, or 1>
-//!   map=<base64 without padding of LEB128 pairs: gap since the previous extent's end, length>
-//!   ```
+//! 1. The map, in a skippable frame (which every zstd decoder skips): `u32 0x184D2A5D`,
+//!    `u32 N`, then N bytes of ASCII:
 //!
-//!   The pairs count units. An extent that ends at the end of the drive may end there
-//!   inside its last unit. Keys a reader doesn't know are ignored; another first line
-//!   (a later version) makes DD-GUI treat the file as plain gzip.
+//!    ```text
+//!    DD-GUI smart image v2
+//!    size=<drive bytes> used=<bytes in extents> extents=<count> unit=<4096, or 1>
+//!    map=<base64 without padding of LEB128 pairs: gap since the previous extent's end, length>
+//!    ```
 //!
+//!    The pairs count units. An extent that ends at the end of the drive may end there
+//!    inside its last unit. Keys a reader doesn't know are ignored; another first line
+//!    (a later version) makes DD-GUI treat the file as plain zstd.
+//!
+//! 2. The drive from start to end, in zstd frames that hold either only used data (up to
+//!    4 MiB of it, compressed at level 3, several frames at once on as many threads; see
+//!    `compressor`) or only free space: zeros, 64 MiB per frame, then
+//!    powers of two down to 4 KiB, then what's left at the very end of the drive. Each size
+//!    of zeros is compressed once and repeated (64 MiB take about 2 KiB). Every frame
+//!    records its size and a checksum of its content, and none holds more than 64 MiB.
+//!
+//! 3. The seek table, in a skippable frame: `u32 0x184D2A5E`, `u32 8 × F + 9`; for each of
+//!    the F frames before it, the map's included, `u32` bytes in the file and `u32` bytes
+//!    decompressed (0 for the map); then the footer: `u32 F`, `u8 0` (no checksums in the
+//!    table), `u32 0x8F92EAB1`.
+//!
+//! [^seekable]: <https://github.com/facebook/zstd/blob/dev/contrib/seekable_format/zstd_seekable_compression_format.md>
+//!
+//! # Version 1: gzip (`.img.gz`), still restored but no longer written
+//!
+//! A multi-member gzip file (RFC 1952), so plain `gunzip` gives the raw image:
+//!
+//! * Every member has an FEXTRA subfield `DG` of 8 bytes: the member's size in the file,
+//!   then its uncompressed size, both u32. With the map, a restore skips members of free
+//!   space without decompressing them.
+//! * The first member is empty; its FCOMMENT holds the map as above, under the first line
+//!   `DD-GUI smart image v1`.
 //! * Then the drive from start to end, in members that are either all used data (up to
-//!   4 MiB each, deflate level 1) or all free space (zeros, 64 MiB or a smaller power
-//!   of two per member, compressed once and repeated).
+//!   4 MiB each, deflate level 1) or all free space (zeros, 64 MiB or a smaller power of
+//!   two per member, compressed once and repeated).
 
 use crate::smart::Extent;
 use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 
-pub const MAGIC: &str = "DD-GUI smart image v1";
-/// The biggest member of zeros.
+/// The first line of a version 2 map.
+pub const MAGIC_V2: &str = "DD-GUI smart image v2";
+/// The first line of a version 1 map (in the first gzip member's comment).
+pub const MAGIC_V1: &str = "DD-GUI smart image v1";
+/// The skippable frame that holds the map.
+const MAP_FRAME: u32 = 0x184D_2A5D;
+/// The skippable frame that holds a seek table (the seekable format's).
+const SEEK_TABLE_FRAME: u32 = 0x184D_2A5E;
+const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
+const FOOTER_LEN: u64 = 9;
+/// The seekable format's limit on frames.
+const MAX_FRAMES: u64 = 0x800_0000;
+/// The compression level for used data: fast, and a good deal smaller than gzip -1.
+pub const LEVEL: i32 = 3;
+/// The most used data in one frame.
+pub const DATA_MAX: usize = 4 << 20;
+/// The biggest frame of zeros (and member, in version 1). No frame holds more.
 pub const ZEROS_MAX: u64 = 64 << 20;
-/// Bytes in a member header with just the `DG` subfield.
-const HEADER_LEN: usize = 24;
-const FEXTRA: u8 = 0x04;
-const FNAME: u8 = 0x08;
-const FCOMMENT: u8 = 0x10;
-const FHCRC: u8 = 0x02;
+/// A map bigger than this is damage, not data: 64 MiB of map is millions of extents.
+const MAP_MAX: u64 = 64 << 20;
 
 /// Which parts of a drive a smart image holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +92,8 @@ impl Map {
         self.extents.last().map_or(0, |e| e.start + e.len)
     }
 
-    pub fn to_comment(&self) -> String {
+    /// The map as text, under a first line of `magic`.
+    pub fn to_text(&self, magic: &str) -> String {
         // Counting in 4 KiB units makes for small numbers. The analysis aligns extents to
         // that, except where the last one stops at the end of the drive.
         let aligned = |e: &Extent| {
@@ -75,7 +113,7 @@ impl Map {
             pos = e.start + e.len;
         }
         format!(
-            "{MAGIC}\nsize={} used={} extents={} unit={unit}\nmap={}\n",
+            "{magic}\nsize={} used={} extents={} unit={unit}\nmap={}\n",
             self.size,
             self.used(),
             self.extents.len(),
@@ -83,11 +121,9 @@ impl Map {
         )
     }
 
-    /// The map in a first member's comment. None when it isn't a (version 1) smart image.
-    pub fn parse(comment: &[u8]) -> Option<Result<Map, String>> {
-        let body = comment
-            .strip_prefix(MAGIC.as_bytes())?
-            .strip_prefix(b"\n")?;
+    /// The map in `text`, whose first line has to be `magic`. None when it isn't.
+    pub fn parse(text: &[u8], magic: &str) -> Option<Result<Map, String>> {
+        let body = text.strip_prefix(magic.as_bytes())?.strip_prefix(b"\n")?;
         Some(
             parse_body(body)
                 .ok_or_else(|| "the map of used space in this smart image is damaged".to_owned()),
@@ -133,6 +169,189 @@ fn parse_body(body: &[u8]) -> Option<Map> {
     (map.extents.len() == count && map.used() == used).then_some(map)
 }
 
+// ---- Version 2 ------------------------------------------------------------------------
+
+/// The skippable frame with the map, which starts a version 2 image.
+pub fn map_frame(map: &Map) -> Vec<u8> {
+    let text = map.to_text(MAGIC_V2);
+    let mut frame = Vec::with_capacity(8 + text.len());
+    frame.extend(MAP_FRAME.to_le_bytes());
+    frame.extend((text.len() as u32).to_le_bytes());
+    frame.extend(text.as_bytes());
+    frame
+}
+
+/// What starts a version 2 smart image.
+pub struct Head {
+    /// The map, or why it's unreadable.
+    pub map: Result<Map, String>,
+    /// Bytes the map's frame takes in the file.
+    pub len: u64,
+}
+
+/// Reads the map frame at the start of `r`. None when there's none: then it isn't a
+/// version 2 smart image (maybe plain zstd, or a later version).
+pub fn read_head(r: &mut impl Read) -> io::Result<Option<Head>> {
+    let mut header = [0u8; 8];
+    if read_full(r, &mut header)? < 8 || le32(&header[..4]) != MAP_FRAME {
+        return Ok(None);
+    }
+    let len = le32(&header[4..]) as u64;
+    if len > MAP_MAX {
+        return Ok(None);
+    }
+    let mut text = Vec::with_capacity(len as usize);
+    r.take(len).read_to_end(&mut text)?;
+    let map = match Map::parse(&text, MAGIC_V2) {
+        None => return Ok(None),
+        Some(_) if (text.len() as u64) < len => Err("the smart image is cut short".to_owned()),
+        Some(map) => map,
+    };
+    Ok(Some(Head { map, len: 8 + len }))
+}
+
+/// A frame as the seek table lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frame {
+    /// Bytes in the file.
+    pub packed: u32,
+    /// Bytes once decompressed.
+    pub len: u32,
+}
+
+/// The seek table (a skippable frame) that ends a version 2 image and lists `frames`.
+pub fn seek_table(frames: &[Frame]) -> Vec<u8> {
+    let body = 8 * frames.len() + FOOTER_LEN as usize;
+    let mut table = Vec::with_capacity(8 + body);
+    table.extend(SEEK_TABLE_FRAME.to_le_bytes());
+    table.extend((body as u32).to_le_bytes());
+    for f in frames {
+        table.extend(f.packed.to_le_bytes());
+        table.extend(f.len.to_le_bytes());
+    }
+    table.extend((frames.len() as u32).to_le_bytes());
+    table.push(0);
+    table.extend(SEEKABLE_MAGIC.to_le_bytes());
+    table
+}
+
+/// Reads the seek table at the end of a file of `size` bytes: the frames it lists, and
+/// where it starts (where the frames end). An error (InvalidData) when there's none.
+pub fn read_seek_table(f: &mut (impl Read + Seek), size: u64) -> io::Result<(Vec<Frame>, u64)> {
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
+    if size < 8 + FOOTER_LEN {
+        return Err(bad("no seek table"));
+    }
+    let mut footer = [0u8; FOOTER_LEN as usize];
+    f.seek(SeekFrom::Start(size - FOOTER_LEN))?;
+    f.read_exact(&mut footer)?;
+    if le32(&footer[5..]) != SEEKABLE_MAGIC {
+        return Err(bad("no seek table"));
+    }
+    let descriptor = footer[4];
+    if descriptor & 0x7c != 0 {
+        return Err(bad("a seek table of an unknown kind"));
+    }
+    let entry = if descriptor & 0x80 != 0 { 12 } else { 8 };
+    let count = le32(&footer[..4]) as u64;
+    let body = count * entry + FOOTER_LEN;
+    if count > MAX_FRAMES || 8 + body > size {
+        return Err(bad("a damaged seek table"));
+    }
+    let start = size - 8 - body;
+    let mut table = vec![0u8; (8 + body - FOOTER_LEN) as usize];
+    f.seek(SeekFrom::Start(start))?;
+    f.read_exact(&mut table)?;
+    if le32(&table[..4]) != SEEK_TABLE_FRAME || le32(&table[4..8]) as u64 != body {
+        return Err(bad("a damaged seek table"));
+    }
+    let frames = table[8..]
+        .chunks_exact(entry as usize)
+        .map(|e| Frame {
+            packed: le32(&e[..4]),
+            len: le32(&e[4..8]),
+        })
+        .collect();
+    Ok((frames, start))
+}
+
+/// A compressor for used data: level 3, with sizes and checksums in the frames.
+///
+/// Its two hash tables are a size smaller than level 3's own (256 + 128 KiB instead of
+/// 512 + 256 KiB), so that they stay in a core's L2 cache while several threads compress
+/// at once. On an 8-core laptop that made 8 threads 2.7 times as fast, for 1% more bytes.
+/// Decoders don't see a difference (the window stays 2 MiB).
+pub fn compressor() -> io::Result<zstd::bulk::Compressor<'static>> {
+    use zstd::zstd_safe::CParameter;
+    let mut c = zstd::bulk::Compressor::new(LEVEL)?;
+    c.set_parameter(CParameter::ChecksumFlag(true))?;
+    c.set_parameter(CParameter::ContentSizeFlag(true))?;
+    c.set_parameter(CParameter::HashLog(16))?;
+    c.set_parameter(CParameter::ChainLog(15))?;
+    Ok(c)
+}
+
+/// Compresses `data` into one frame, in `out` (whose old content goes).
+pub fn compress(c: &mut zstd::bulk::Compressor, data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    out.clear();
+    out.reserve(zstd::zstd_safe::compress_bound(data.len()));
+    c.compress_to_buffer(data, out).map(|_| ())
+}
+
+/// Frames of zeros: each size compressed once, then repeated.
+#[derive(Default)]
+pub struct Zeros {
+    frames: HashMap<u64, Vec<u8>>,
+}
+
+impl Zeros {
+    /// How `len` bytes of free space get cut into frames: 64 MiB at a time, then powers of
+    /// two down to 4 KiB (gaps are 4 KiB-aligned), then whatever is left at the very end of
+    /// a drive. That keeps the number of different frames small.
+    pub fn pieces(mut len: u64) -> impl Iterator<Item = u64> {
+        std::iter::from_fn(move || {
+            let piece = match len {
+                0 => return None,
+                ZEROS_MAX.. => ZEROS_MAX,
+                4096.. => 1 << len.ilog2(),
+                _ => len,
+            };
+            len -= piece;
+            Some(piece)
+        })
+    }
+
+    /// The frame for `len` bytes of zeros (`len` being one of the `pieces`).
+    pub fn frame(&mut self, len: u64) -> io::Result<&[u8]> {
+        if !self.frames.contains_key(&len) {
+            let frame = zeros_frame(len)?;
+            self.frames.insert(len, frame);
+        }
+        Ok(&self.frames[&len])
+    }
+}
+
+fn zeros_frame(len: u64) -> io::Result<Vec<u8>> {
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), LEVEL)?;
+    encoder.include_checksum(true)?;
+    encoder.set_pledged_src_size(Some(len))?;
+    let zeros = vec![0u8; len.min(1 << 20) as usize];
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(zeros.len() as u64) as usize;
+        encoder.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    encoder.finish()
+}
+
+// ---- Version 1 ------------------------------------------------------------------------
+
+const FEXTRA: u8 = 0x04;
+const FNAME: u8 = 0x08;
+const FCOMMENT: u8 = 0x10;
+const FHCRC: u8 = 0x02;
+
 /// A gzip member header, as far as DD-GUI cares.
 #[derive(Debug, Default)]
 pub struct Header {
@@ -177,16 +396,13 @@ pub fn read_header(r: &mut impl BufRead) -> io::Result<Header> {
                 break;
             };
             if rest[..2] == *b"DG" && len == 8 {
-                let csize = u32::from_le_bytes(data[..4].try_into().unwrap());
-                let usize = u32::from_le_bytes(data[4..].try_into().unwrap());
-                header.sizes = Some((csize as u64, usize as u64));
+                header.sizes = Some((le32(&data[..4]) as u64, le32(&data[4..]) as u64));
             }
             rest = &rest[4 + len..];
         }
     }
-    // Limits keep a hostile file from making probe() eat memory. 64 MiB of map is
-    // millions of extents.
-    for (flag, limit) in [(FNAME, 1 << 16), (FCOMMENT, 64 << 20)] {
+    // Limits keep a hostile file from making probe() eat memory.
+    for (flag, limit) in [(FNAME, 1 << 16), (FCOMMENT, MAP_MAX)] {
         if flags & flag != 0 {
             let mut text = Vec::new();
             r.by_ref().take(limit).read_until(0, &mut text)?;
@@ -206,99 +422,101 @@ pub fn read_header(r: &mut impl BufRead) -> io::Result<Header> {
     Ok(header)
 }
 
-fn header(csize: u64, usize: u64, mtime: u32, comment: Option<&[u8]>) -> Vec<u8> {
-    let flags = FEXTRA | if comment.is_some() { FCOMMENT } else { 0 };
-    let mut h = Vec::with_capacity(HEADER_LEN + comment.map_or(0, |c| c.len() + 1));
-    h.extend([0x1f, 0x8b, 8, flags]);
-    h.extend(mtime.to_le_bytes());
-    h.extend([0, 255]); // XFL, OS: unknown
-    h.extend(12u16.to_le_bytes());
-    h.extend(*b"DG");
-    h.extend(8u16.to_le_bytes());
-    h.extend(u32::try_from(csize).unwrap_or(u32::MAX).to_le_bytes());
-    h.extend(u32::try_from(usize).unwrap_or(u32::MAX).to_le_bytes());
-    if let Some(comment) = comment {
-        h.extend(comment);
-        h.push(0);
-    }
-    h
-}
+/// Writes version 1 images, which DD-GUI no longer does: for testing that they restore.
+#[cfg(all(test, unix))]
+pub mod v1 {
+    use super::*;
 
-/// Writes one member around raw deflate data; returns its size.
-pub fn write_member(out: &mut impl Write, deflated: &[u8], crc: u32, len: u64) -> io::Result<u64> {
-    let csize = (HEADER_LEN + deflated.len() + 8) as u64;
-    out.write_all(&header(csize, len, 0, None))?;
-    out.write_all(deflated)?;
-    out.write_all(&crc.to_le_bytes())?;
-    out.write_all(&(len as u32).to_le_bytes())?;
-    Ok(csize)
-}
+    /// Bytes in a member header with just the `DG` subfield.
+    const HEADER_LEN: usize = 24;
 
-/// The first member: no data, the map in its comment.
-pub fn map_member(map: &Map, mtime: u32) -> Vec<u8> {
-    let comment = map.to_comment();
-    // An empty deflate stream: one final fixed-Huffman block holding only end-of-block.
-    let empty = [0x03, 0x00];
-    let csize = (HEADER_LEN + comment.len() + 1 + empty.len() + 8) as u64;
-    let mut member = header(csize, 0, mtime, Some(comment.as_bytes()));
-    member.extend(empty);
-    member.extend([0u8; 8]); // CRC and length of nothing
-    member
-}
-
-/// A data member: deflate level 1, which also stores incompressible blocks as they are.
-pub fn data_member(data: &[u8]) -> (Vec<u8>, u32) {
-    let mut crc = flate2::Crc::new();
-    crc.update(data);
-    (miniz_oxide::deflate::compress_to_vec(data, 1), crc.sum())
-}
-
-/// Members of zeros, compressed once and then repeated.
-#[derive(Default)]
-pub struct Zeros {
-    members: HashMap<u64, Vec<u8>>,
-}
-
-impl Zeros {
-    /// Writes `len` bytes of zeros; returns how many bytes that took.
-    pub fn write(&mut self, out: &mut impl Write, mut len: u64) -> io::Result<u64> {
-        let mut written = 0;
-        while len > 0 {
-            // 64 MiB at a time, then powers of two down to 4 KiB (gaps are 4 KiB-aligned),
-            // then whatever is left at the very end of a drive.
-            let piece = match len {
-                ZEROS_MAX.. => ZEROS_MAX,
-                4096.. => 1 << len.ilog2(),
-                _ => len,
-            };
-            let member = self
-                .members
-                .entry(piece)
-                .or_insert_with(|| zeros_member(piece));
-            out.write_all(member)?;
-            written += member.len() as u64;
-            len -= piece;
+    fn header(csize: u64, usize: u64, comment: Option<&[u8]>) -> Vec<u8> {
+        let flags = FEXTRA | if comment.is_some() { FCOMMENT } else { 0 };
+        let mut h = Vec::new();
+        h.extend([0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 0, 255]);
+        h.extend(12u16.to_le_bytes());
+        h.extend(*b"DG");
+        h.extend(8u16.to_le_bytes());
+        h.extend(u32::try_from(csize).unwrap_or(u32::MAX).to_le_bytes());
+        h.extend(u32::try_from(usize).unwrap_or(u32::MAX).to_le_bytes());
+        if let Some(comment) = comment {
+            h.extend(comment);
+            h.push(0);
         }
-        Ok(written)
+        h
+    }
+
+    /// One member around raw deflate data.
+    fn member(out: &mut Vec<u8>, deflated: &[u8], crc: u32, len: u64) {
+        let csize = (HEADER_LEN + deflated.len() + 8) as u64;
+        out.extend(header(csize, len, None));
+        out.extend(deflated);
+        out.extend(crc.to_le_bytes());
+        out.extend((len as u32).to_le_bytes());
+    }
+
+    fn deflate(data: &[u8], level: u32) -> (Vec<u8>, u32) {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+        encoder.write_all(data).expect("writing to memory");
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        (encoder.finish().expect("writing to memory"), crc.sum())
+    }
+
+    fn data_member(out: &mut Vec<u8>, data: &[u8]) {
+        let (deflated, crc) = deflate(data, 1);
+        member(out, &deflated, crc, data.len() as u64);
+    }
+
+    /// Members of `len` bytes of zeros, the way version 1 cut them.
+    pub fn zeros(out: &mut Vec<u8>, len: u64) {
+        for piece in Zeros::pieces(len) {
+            let (deflated, crc) = deflate(&vec![0u8; piece as usize], 6);
+            member(out, &deflated, crc, piece);
+        }
+    }
+
+    /// A version 1 smart image of `drive` (its bytes), holding the extents of `map`.
+    pub fn image(drive: &[u8], map: &Map) -> Vec<u8> {
+        let comment = map.to_text(MAGIC_V1);
+        let mut out = Vec::new();
+        let empty = [0x03, 0x00]; // a final fixed-Huffman block with only end-of-block
+        let csize = (HEADER_LEN + comment.len() + 1 + empty.len() + 8) as u64;
+        out.extend(header(csize, 0, Some(comment.as_bytes())));
+        out.extend(empty);
+        out.extend([0u8; 8]);
+        let mut pos = 0;
+        for e in &map.extents {
+            zeros(&mut out, e.start - pos);
+            let data = &drive[e.start as usize..(e.start + e.len) as usize];
+            for piece in data.chunks(DATA_MAX) {
+                data_member(&mut out, piece);
+            }
+            pos = e.start + e.len;
+        }
+        zeros(&mut out, map.size - pos);
+        out
     }
 }
 
-fn zeros_member(len: u64) -> Vec<u8> {
-    // zlib-rs handles long runs of zeros many times faster than miniz_oxide.
-    let zeros = vec![0u8; len.min(1 << 20) as usize];
-    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
-    let mut crc = flate2::Crc::new();
-    let mut left = len;
-    while left > 0 {
-        let n = left.min(zeros.len() as u64) as usize;
-        encoder.write_all(&zeros[..n]).expect("writing to memory");
-        crc.update(&zeros[..n]);
-        left -= n as u64;
+// ---- Shared ---------------------------------------------------------------------------
+
+fn le32(b: &[u8]) -> u32 {
+    u32::from_le_bytes(b[..4].try_into().expect("4 bytes"))
+}
+
+fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
-    let deflated = encoder.finish().expect("writing to memory");
-    let mut member = Vec::with_capacity(HEADER_LEN + deflated.len() + 8);
-    write_member(&mut member, &deflated, crc.sum(), len).expect("writing to memory");
-    member
+    Ok(n)
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {

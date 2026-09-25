@@ -36,9 +36,9 @@ pub enum Outcome {
 }
 
 pub enum Work {
-    /// `DD-GUI dd` with these operands.
+    /// `dd-gui dd` with these operands.
     Dd(Vec<String>),
-    /// `DD-GUI copy`: `mode` is "smart" or "restore". With `ask`, the worker
+    /// `dd-gui copy`: `mode` is "smart", "restore" or "zeros". With `ask`, the worker
     /// reports the layout and waits for `Job::answer`; "full" then runs dd with `dd_args`.
     Copy {
         mode: &'static str,
@@ -415,7 +415,7 @@ mod macos {
 
     pub fn start(exe: &Path, spec: &Spec, sink: Sink) -> Result<Job, String> {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        let dir = std::env::temp_dir().join(format!("DD-GUI-{}-{}", std::process::id(), stamp.as_millis()));
+        let dir = std::env::temp_dir().join(format!("dd-gui-{}-{}", std::process::id(), stamp.as_millis()));
         std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create a temporary folder: {e}"))?;
         let status_path = dir.join("status");
         let output_path = dir.join("output");

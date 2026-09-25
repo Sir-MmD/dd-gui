@@ -110,6 +110,14 @@ impl Plan<'_> {
                 ops.push(("count", room.to_string()));
                 iflag.push("count_bytes");
             }
+            // Windows may refuse a read that runs past the end of a drive instead of
+            // returning what's left, and drives rarely end on a whole block: stop right at
+            // the end.
+            (None, Source::Drive(d), _) if cfg!(windows) => {
+                let left = d.size.saturating_sub(o.skip.unwrap_or(0).saturating_mul(bs));
+                ops.push(("count", left.to_string()));
+                iflag.push("count_bytes");
+            }
             _ => {}
         }
         if let Some(skip) = o.skip.filter(|&n| n > 0) {
@@ -120,6 +128,11 @@ impl Plan<'_> {
         }
         if self.direct_in() {
             iflag.push("direct");
+        }
+        // conv=sync pads every short read, not just the last one: only whole blocks may
+        // come short of it (a file on a network share can return less than asked).
+        if self.pads_last_block() {
+            iflag.push("fullblock");
         }
         if !iflag.is_empty() {
             ops.push(("iflag", iflag.join(",")));
@@ -211,7 +224,8 @@ impl Plan<'_> {
         }
         words.push(("", "dd".to_owned()));
         words.extend(self.operands());
-        if self.sync_after().is_some() {
+        // Windows has no `sync` (DD-GUI still flushes the drive there).
+        if self.sync_after().is_some() && !cfg!(windows) {
             words.push(("", "&& sync".to_owned()));
         }
         words
@@ -316,7 +330,12 @@ impl Plan<'_> {
         }
         let o = self.opts;
         if self.restores_image() && (o.count.is_some() || o.skip.is_some() || o.seek.is_some()) {
-            return Some("Count, skip and seek don't apply when writing compressed or DD-GUI images. Clear them in Advanced.".into());
+            return Some("Count, skip and seek don't apply when writing compressed images, virtual disks or DD-GUI images. Clear them in Advanced.".into());
+        }
+        // Windows wipes with DD-GUI's own copier (`copy --mode=zeros`), which starts at the
+        // start of the drive.
+        if cfg!(windows) && matches!(self.source, Source::Zeros) && o.seek.is_some_and(|n| n > 0) {
+            return Some("Seek doesn't apply when writing zeros on Windows. Clear it in Advanced.".into());
         }
         if self.pads_last_block()
             && let (Some(total), Some(room)) = (self.total_bytes(), self.target_room())

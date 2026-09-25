@@ -30,25 +30,32 @@ pub struct Reporter {
 }
 
 impl Reporter {
-    pub fn start(progress: Arc<Progress>, total: u64, worker: bool) -> Reporter {
+    /// `total` is what `done` counts toward, when that's known (DONE never goes past it).
+    pub fn start(progress: Arc<Progress>, total: Option<u64>, worker: bool) -> Reporter {
         let (stop, stopped) = mpsc::channel::<()>();
         let thread = std::thread::spawn(move || {
             let started = Instant::now();
             loop {
                 let last = stopped.recv_timeout(Duration::from_millis(500))
                     != Err(RecvTimeoutError::Timeout);
-                let done = progress.done.load(Relaxed).min(total);
+                let done = progress.done.load(Relaxed);
+                let done = total.map_or(done, |total| done.min(total));
                 let written = progress.written.load(Relaxed);
                 if worker {
                     let mut out = std::io::stdout().lock();
                     let _ = writeln!(out, "@progress {done} {written}");
                     let _ = out.flush();
                 } else {
-                    let percent = (done * 100).checked_div(total).unwrap_or(100);
+                    let percent = match total {
+                        Some(total) => {
+                            format!("{:>3}% · ", (done * 100).checked_div(total).unwrap_or(100))
+                        }
+                        None => String::new(),
+                    };
                     let rate = written as f64 / started.elapsed().as_secs_f64().max(0.001);
                     let end = if last { "\n" } else { "" };
                     eprint!(
-                        "\r{percent:>3}% · {} written · {}    {end}",
+                        "\r{percent}{} written · {}    {end}",
                         crate::fmt::bytes(written),
                         crate::fmt::speed(rate)
                     );

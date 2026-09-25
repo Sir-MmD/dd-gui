@@ -26,13 +26,20 @@ accent `#F46A0E`.
 
 | File | What |
 |---|---|
-| `icon.svg` | Master, 1024 × 1024. Used for 128 px and up, and as the scalable Linux icon. |
+| `icon.svg` | Master, 1024 × 1024. Used for 128 px and up, as the scalable Linux icon, and as the window icon (`ui/app.slint`). Slint renders it with resvg, so it stays plain paths: no filters, no external references. |
 | `icon-small.svg` | 32 px version drawn on the pixel grid (no platter detail). |
-| `png/DD-GUI-<n>.png` | 16, 24, 32, 48, 64, 128, 256, 512, 1024 px. |
-| `DD-GUI.ico` | Windows: 16–256 px (BMP up to 64, PNG for 128 and 256). Embedded by `build.rs`. |
-| `DD-GUI.icns` | macOS: 16–1024 px, on Apple's icon grid (824 px tile in 1024). |
-| `../ui/logo.svg` | The in-app mark and window icon, drawn on a 30 px grid. |
+| `png/dd-gui-<n>.png` | 16, 24, 32, 48, 64, 128, 256, 512, 1024 px. |
+| `dd-gui.ico` | Windows: 16–256 px (BMP up to 64, PNG for 128 and 256). Embedded in `dd-gui.exe` by `build.rs`. |
+| `dd-gui.icns` | macOS: 16–1024 px, on Apple's icon grid (824 px tile in 1024). Goes into `DD-GUI.app`. |
+| `../ui/logo.svg` | The in-app mark, drawn on a 30 px grid. |
 | `contact-sheet.png` | The three concepts. |
+
+File names are lowercase `dd-gui`, like the binary; "DD-GUI" is only the name people see.
+
+The Linux binary carries `icon.svg` and the PNGs from 16 to 512 px itself
+(`src/desktop.rs`): when it starts, it puts them in `~/.local/share/icons/hicolor` as
+`dd-gui.png` / `dd-gui.svg` (if they differ), next to a `dd-gui.desktop` entry. So a
+changed icon reaches users with the next build of the binary.
 
 At 64 px and below each size is drawn separately, with every edge on a whole pixel.
 The detail drops away as space runs out: 64 px keeps the clamp ring and the arm cut,

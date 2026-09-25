@@ -270,6 +270,12 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
     !data.iter().fold(!0u32, |c, &b| (c >> 8) ^ CRC32[((c ^ u32::from(b)) & 0xFF) as usize])
 }
 
+/// Raw CRC-32 (IEEE) update without inversions: the kernel's crc32_le, which F2FS, LVM and
+/// NILFS use with seeds of their own.
+pub(crate) fn crc32_le(crc: u32, data: &[u8]) -> u32 {
+    data.iter().fold(crc, |c, &b| (c >> 8) ^ CRC32[((c ^ u32::from(b)) & 0xFF) as usize])
+}
+
 /// Raw CRC-32C update (no inversions), the way ext4 chains it.
 pub(crate) fn crc32c(crc: u32, data: &[u8]) -> u32 {
     data.iter().fold(crc, |c, &b| (c >> 8) ^ CRC32C[((c ^ u32::from(b)) & 0xFF) as usize])

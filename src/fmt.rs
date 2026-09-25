@@ -32,6 +32,64 @@ pub fn duration(secs: f64) -> String {
     }
 }
 
+/// A file system's name as people know it, from the blkid-style names the smart analysis
+/// and lsblk use: "vfat" → "FAT", "crypto_LUKS" → "LUKS". Unknown names pass through.
+pub fn fs_name(name: &str) -> String {
+    let known = match name {
+        "vfat" | "msdos" | "fat" => "FAT",
+        "exfat" => "exFAT",
+        "ntfs" | "ntfs3" => "NTFS",
+        "refs" | "ReFS" => "ReFS",
+        "btrfs" => "Btrfs",
+        "xfs" => "XFS",
+        "f2fs" => "F2FS",
+        "LVM2_member" | "lvm2" => "LVM",
+        "swap" => "swap",
+        "swsuspend" => "hibernation",
+        "iso9660" => "ISO 9660",
+        "udf" => "UDF",
+        "apfs" => "APFS",
+        "hfsplus" => "HFS+",
+        "hfs" => "HFS",
+        "crypto_LUKS" => "LUKS",
+        "BitLocker" => "BitLocker",
+        "squashfs" | "squashfs3" => "SquashFS",
+        "linux_raid_member" => "Linux RAID",
+        "zfs_member" => "ZFS",
+        "jfs" => "JFS",
+        "reiserfs" => "ReiserFS",
+        "reiser4" => "Reiser4",
+        "nilfs2" => "NILFS2",
+        "erofs" => "EROFS",
+        "cramfs" => "cramfs",
+        "romfs" => "romfs",
+        "minix" => "Minix",
+        "ufs" => "UFS",
+        "vxfs" => "VxFS",
+        "gfs" => "GFS",
+        "gfs2" => "GFS2",
+        "ocfs2" => "OCFS2",
+        "VMFS" | "vmfs" | "VMFS_volume_member" => "VMFS",
+        "bcache" => "bcache",
+        "bcachefs" => "bcachefs",
+        "oracleasm" => "Oracle ASM",
+        "hpfs" => "HPFS",
+        "ubifs" => "UBIFS",
+        "ubi" => "UBI",
+        "bfs" => "BFS",
+        "zonefs" => "zonefs",
+        "LVM1_member" => "LVM1",
+        "DM_integrity" => "dm-integrity",
+        "DM_verity_hash" => "dm-verity",
+        "DM_snapshot_cow" => "LVM snapshot",
+        "vdo" => "VDO",
+        "stratis" => "Stratis",
+        "ceph_bluestore" => "Ceph BlueStore",
+        _ => return name.to_owned(),
+    };
+    known.to_owned()
+}
+
 /// dd's notation: 4194304 → "4M".
 pub fn block_size(n: u64) -> String {
     for (unit, size) in [("G", 1u64 << 30), ("M", 1 << 20), ("K", 1 << 10)] {
@@ -69,5 +127,14 @@ mod tests {
         assert_eq!(duration(42.0), "42s");
         assert_eq!(duration(78.0), "1m 18s");
         assert_eq!(duration(3900.0), "1h 05m");
+    }
+
+    #[test]
+    fn file_systems() {
+        assert_eq!(fs_name("vfat"), "FAT");
+        assert_eq!(fs_name("crypto_LUKS"), "LUKS");
+        assert_eq!(fs_name("hfsplus"), "HFS+");
+        assert_eq!(fs_name("ext4"), "ext4");
+        assert_eq!(fs_name("something_new"), "something_new");
     }
 }
