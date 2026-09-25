@@ -1,0 +1,4 @@
+# cmd.exe wants CRLF; the shell scripts must keep LF to run on Linux and macOS.
+*.bat     text eol=crlf
+*.sh      text eol=lf
+*.command text eol=lf

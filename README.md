@@ -100,25 +100,42 @@ Without polkit, set `DD_GUI_ELEVATE` to another tool, e.g. `DD_GUI_ELEVATE="sudo
 
 ## Build
 
-```sh
-cargo build --release
-./target/release/dd-gui                  # or: dd-gui some-image.iso
-```
+Each OS has a build script. It checks the build dependencies and offers to install any that
+are missing, builds the release binary, and puts the result in `dist/`. The output looks
+like pacman's.
 
-You need Rust and a C compiler, for libzstd. On Linux, the binary only needs libc,
-fontconfig and freetype. X11, Wayland and OpenGL are loaded at runtime if they're present,
-and a software renderer is built in.
+| OS | Run | You get |
+|---|---|---|
+| Linux | `./build.sh` | `dist/dd-gui` |
+| macOS | `./build.command`, or double-click it | `dist/DD-GUI.app`, and a zip of it |
+| Windows | `build.bat`, or double-click it | `dist\dd-gui.exe` |
 
-- **Linux:** there's nothing to install. On start, the binary copies its icons and a menu
-  entry into `~/.local/share`, so menus, docks and the Wayland taskbar show it with its icon.
-  Set `DD_GUI_NO_DESKTOP_INTEGRATION=1` to turn that off.
-- **Windows:** `dd-gui.exe` carries its icon, version info and an administrator manifest.
-  You can also cross-build it from Linux:
+- **Dependencies:** Rust 1.93 or newer, plus:
+  - Linux: a C compiler, pkg-config and fontconfig's headers, from the distribution's
+    package manager (pacman, apt, dnf or zypper);
+  - macOS: the Xcode Command Line Tools;
+  - Windows: the Visual C++ build tools and a Windows SDK.
 
-  ```sh
-  cargo build --release --target x86_64-pc-windows-gnu    # needs mingw-w64
-  ```
-- **macOS:** CI wraps the binary in a `DD-GUI.app`.
+  Rust comes from rustup. Before installing anything, the script lists the packages and asks
+  `:: Proceed with installation? [Y/n]`.
+- **Options:**
+  - `--check` also builds and runs the tests. On Windows this needs an administrator prompt.
+  - `--clean` starts from scratch.
+  - `--noconfirm` installs missing dependencies without asking.
+  - `build.command --universal` makes one app for both Apple Silicon and Intel Macs.
+- **macOS "unidentified developer" warning:** macOS may refuse to open `build.command` from
+  a zip downloaded in a browser. Right-click it and choose Open, or run it from Terminal.
+  A `git clone` doesn't have this problem.
+- **Building by hand:** `cargo build --release` works too, once the dependencies are there.
+- **Running it:**
+  - Linux: the binary only needs libc, fontconfig and freetype. X11, Wayland and OpenGL
+    are loaded at runtime if they're present, and a software renderer is built in. On start,
+    it copies its icons and a menu entry into `~/.local/share`, so menus, docks and the
+    Wayland taskbar show it with its icon. Set `DD_GUI_NO_DESKTOP_INTEGRATION=1` to turn
+    that off.
+  - Windows: `dd-gui.exe` carries its icon, version info and an administrator manifest.
+    You can also cross-build it from Linux with mingw-w64:
+    `cargo build --release --target x86_64-pc-windows-gnu`.
 
 `.github/workflows/build.yml` builds and tests all three, and runs end-to-end tests with
 virtual disks (`ci/`). `packaging/README.md` covers the desktop entry, icons and app bundle.

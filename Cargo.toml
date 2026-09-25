@@ -2,6 +2,8 @@
 name = "dd-gui"
 version = "0.1.0"
 edition = "2024"
+# sevenz-rust2 needs 1.93 (Slint 1.92); build.sh, build.command and build.bat check for it too.
+rust-version = "1.93"
 description = "A simple, good-looking GUI for dd, shipped as a single binary"
 repository = "https://github.com/Sir-MmD/dd-gui"
 homepage = "https://github.com/Sir-MmD/dd-gui"
