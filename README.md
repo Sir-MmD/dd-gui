@@ -59,36 +59,81 @@ in full.
 
 ## Download
 
+Get the archive for your system from the [latest release](https://github.com/Sir-MmD/dd-gui/releases/latest).
+
 | Platform | File | Requires |
 |---|---|---|
-| Linux x86_64 | `dd-gui-<version>-linux-x86_64.tar.gz` | glibc 2.28 or newer |
+| Linux x86_64 | `dd-gui-<version>-linux-x86_64.tar.gz` | glibc 2.28+ (2018 or newer distributions) |
+| Linux arm64 | `dd-gui-<version>-linux-arm64.tar.gz` | glibc 2.28+ |
 | Windows x86_64 | `dd-gui-<version>-windows-x86_64.zip` | Windows 10 or newer |
-| macOS | | [Build from source](#building) |
+| Windows arm64 | `dd-gui-<version>-windows-arm64.zip` | Windows 10 or newer |
+| macOS Apple Silicon | `dd-gui-<version>-macos-arm64.zip` | macOS 11 or newer |
+
+Each download holds one self-contained program. On Linux, extract it and run `./dd-gui`.
 
 Writing to a drive needs administrator rights:
 - **Linux:** DD-GUI asks through polkit, or through the tool named in `DD_GUI_ELEVATE`, such as `sudo -A`.
 - **macOS:** the system password prompt appears.
 - **Windows:** DD-GUI asks when it starts.
 
-On Linux, DD-GUI adds itself to the application menu on first start. Set
-`DD_GUI_NO_DESKTOP_INTEGRATION=1` to prevent this.
+The Windows and macOS builds aren't code-signed:
+- **Windows:** in SmartScreen, choose *More info* → *Run anyway*.
+- **macOS:** the first time, right-click the app and choose *Open*.
 
 ## Building
 
-Rust 1.93 or newer is required. The build scripts install anything else that's missing,
-after asking, and put the result in `dist/`.
+Every platform needs [Rust](https://rustup.rs) 1.93 or newer. Each build script checks the
+rest, offers to install what's missing, and puts the result in `dist/`.
 
-| Platform | Command | Output |
-|---|---|---|
-| Linux | `./build.sh` | `dist/dd-gui` |
-| macOS | `./build.command` | `dist/DD-GUI.app` |
-| Windows | `build.bat` | `dist\dd-gui.exe` |
+### Linux
 
-Options:
-- `--check` runs the tests.
+Needs a C compiler. The script installs one through pacman, apt, dnf or zypper if it's missing.
+
+```sh
+git clone https://github.com/Sir-MmD/dd-gui.git
+cd dd-gui
+./build.sh            # → dist/dd-gui
+```
+
+### macOS
+
+Needs the Xcode Command Line Tools (`xcode-select --install`).
+
+```sh
+git clone https://github.com/Sir-MmD/dd-gui.git
+cd dd-gui
+./build.command       # → dist/DD-GUI.app, for this Mac's architecture
+./build.command --universal   # Apple Silicon and Intel in one app
+```
+
+### Windows
+
+Needs the Visual Studio Build Tools with the C++ workload and a Windows SDK. The script
+installs them if they're missing.
+
+```bat
+git clone https://github.com/Sir-MmD/dd-gui.git
+cd dd-gui
+build.bat
+```
+
+The result is `dist\dd-gui.exe`. You can also double-click `build.bat`.
+
+### Options
+
+- `--check` runs the tests. On Windows this needs an administrator prompt.
 - `--clean` rebuilds from scratch.
 - `--noconfirm` skips the prompts.
-- `--universal` (macOS only) builds for both Apple Silicon and Intel.
+
+### Cross-compiling
+
+The release binaries for Linux are built with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)
+against glibc 2.28:
+
+```sh
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.28
+```
 
 ## Command line
 

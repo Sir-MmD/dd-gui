@@ -12,32 +12,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: ${{ matrix.artifact }}
+  # Tests, the native build and the end-to-end tests on each OS. Windows x64 and macOS arm64
+  # also package their release archives here.
+  native:
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # An older Ubuntu keeps the glibc requirement low, so the binary runs on more distros.
           - os: ubuntu-22.04
-            artifact: dd-gui-linux-x86_64
-            path: target/release/dd-gui
-          # MSVC: build.rs embeds the icon and version info with rc.exe from the Windows SDK.
+            name: linux-x86_64 tests
           - os: windows-latest
+            name: windows-x86_64
             artifact: dd-gui-windows-x86_64
-            path: target/release/dd-gui.exe
           - os: macos-latest
-            artifact: DD-GUI-macos-arm64
-            path: target/release/DD-GUI-macos-arm64.zip
+            name: macos-arm64
+            artifact: dd-gui-macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       # zstd-sys compiles libzstd's C with the runner's own compiler (gcc, clang or MSVC).
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --locked
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
+      - name: Version
+        id: version
+        shell: bash
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_OUTPUT"
 
       - name: Check dd-gui.exe's icon, version info and manifest
         if: runner.os == 'Windows'
@@ -57,16 +60,20 @@ jobs:
           # Every size of assets/dd-gui.ico, the version strings, exactly one manifest.
           python packaging/windows/check-exe.py $exe
           if ($LASTEXITCODE -ne 0) { throw 'dd-gui.exe failed packaging/windows/check-exe.py' }
+      - name: Package dd-gui.exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/release/dd-gui.exe -DestinationPath "dist/dd-gui-${{ steps.version.outputs.version }}-windows-x86_64.zip"
 
       - name: Bundle DD-GUI.app
         if: runner.os == 'macOS'
         run: |
-          # cargo pkgid prints e.g. path+file:///…/dd-gui#0.1.0 (or …#dd-gui@0.1.0)
-          id=$(cargo pkgid)
-          version=${id##*[#@]}
+          version=${{ steps.version.outputs.version }}
           app=target/release/DD-GUI.app
           rm -rf "$app"
-          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" dist
           cp target/release/dd-gui "$app/Contents/MacOS/dd-gui"
           cp assets/dd-gui.icns "$app/Contents/Resources/dd-gui.icns"
           sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
@@ -79,35 +86,34 @@ jobs:
           codesign --force --sign - "$app"
           codesign --verify --strict --verbose=2 "$app"
           # ditto keeps the executable bit and the signature; upload-artifact's own zip would not.
-          ditto -c -k --keepParent "$app" target/release/DD-GUI-macos-arm64.zip
+          ditto -c -k --keepParent "$app" "dist/dd-gui-$version-macos-arm64.zip"
 
       - uses: actions/upload-artifact@v4
+        if: matrix.artifact
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.path }}
+          path: dist/*
           if-no-files-found: error
 
       # End-to-end tests run the release binary for real, as root / administrator. Each
       # script gets the binary's absolute path as its first argument and in DD_GUI, and
-      # runs from the repository root. They're skipped while the scripts don't exist.
+      # runs from the repository root.
       - name: End-to-end tests (Linux)
-        if: runner.os == 'Linux' && hashFiles('ci/e2e-linux.sh') != ''
+        if: runner.os == 'Linux'
         timeout-minutes: 30
         env:
           DD_GUI: ${{ github.workspace }}/target/release/dd-gui
         run: sudo DD_GUI="$DD_GUI" bash ci/e2e-linux.sh "$DD_GUI"
-
       - name: End-to-end tests (macOS)
-        if: runner.os == 'macOS' && hashFiles('ci/e2e-macos.sh') != ''
+        if: runner.os == 'macOS'
         timeout-minutes: 30
         env:
           # The binary as shipped: inside the signed bundle.
           DD_GUI: ${{ github.workspace }}/target/release/DD-GUI.app/Contents/MacOS/dd-gui
         # The runner's bash (not necessarily macOS's old /bin/bash), as root.
         run: sudo DD_GUI="$DD_GUI" "$(command -v bash)" ci/e2e-macos.sh "$DD_GUI"
-
       - name: End-to-end tests (Windows)
-        if: runner.os == 'Windows' && hashFiles('ci/e2e-windows.ps1') != ''
+        if: runner.os == 'Windows'
         timeout-minutes: 30
         shell: pwsh
         env:
@@ -116,8 +122,132 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File ci/e2e-windows.ps1 $env:DD_GUI
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+  # The Linux release binaries: built with zig against glibc 2.28, so they run on any
+  # distribution since 2018 or so. fontconfig, X11, Wayland and OpenGL load at runtime.
+  linux-release:
+    name: linux-${{ matrix.arch }} release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28
+      - name: Check the glibc it needs
+        run: |
+          bin=target/${{ matrix.target }}/release/dd-gui
+          readelf -d "$bin" | grep NEEDED
+          need=$(readelf -W --dyn-syms "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1)
+          echo "newest glibc symbol: $need"
+          test "$(printf '%s\n' "$need" GLIBC_2.28 | sort -V | tail -n1)" = GLIBC_2.28
+      - name: Package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          mkdir -p dist
+          tar --owner=0 --group=0 --numeric-owner -C target/${{ matrix.target }}/release \
+            -czf "dist/dd-gui-$version-linux-${{ matrix.arch }}.tar.gz" dd-gui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dd-gui-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # The Linux release binaries on the oldest system they support (Debian 10, glibc 2.28),
+  # on real x86_64 and arm64 machines.
+  linux-smoke:
+    name: linux-${{ matrix.arch }} on Debian 10
+    needs: linux-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dd-gui-linux-${{ matrix.arch }}
+      - name: Smoke test
+        run: |
+          tar -xzf dd-gui-*-linux-${{ matrix.arch }}.tar.gz
+          docker run --rm -v "$PWD:/w" -w /w debian:10 sh -ec '
+            ./dd-gui dd if=/dev/urandom of=a.bin bs=1M count=16 status=none
+            ./dd-gui dd if=a.bin of=b.bin bs=4M
+            cmp a.bin b.bin
+            ./dd-gui copy --mode=zeros --to=z.bin --size=8M
+            head -c 8388608 /dev/zero | cmp - z.bin
+            ./dd-gui copy --mode=smart --from=a.bin --to=a.img.zst
+            ./dd-gui copy --mode=restore --from=a.img.zst --to=c.bin
+            cmp a.bin c.bin
+            gzip -k a.bin
+            ./dd-gui copy --mode=restore --from=a.bin.gz --to=d.bin
+            cmp a.bin d.bin
+            echo PASS
+          '
+
+  # Windows on arm64, built and checked on an arm64 machine.
+  windows-arm64:
+    name: windows-arm64
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Check dd-gui.exe
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/dd-gui.exe).Path
+          $info = (Get-Item $exe).VersionInfo
+          if ($info.ProductName -ne 'DD-GUI') { throw 'dd-gui.exe is missing its version info' }
+          if (Get-Command python -ErrorAction SilentlyContinue) {
+            python packaging/windows/check-exe.py $exe
+            if ($LASTEXITCODE -ne 0) { throw 'dd-gui.exe failed packaging/windows/check-exe.py' }
+          }
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/dd-gui.exe).Path
+          $bytes = New-Object byte[] (16MB); (New-Object Random 7).NextBytes($bytes)
+          [IO.File]::WriteAllBytes("$PWD\a.bin", $bytes)
+          & $exe dd if=a.bin of=b.bin bs=4M
+          if ((Get-FileHash a.bin).Hash -ne (Get-FileHash b.bin).Hash) { throw 'dd copy differs' }
+          & $exe copy --mode=smart --from=a.bin --to=a.img.zst
+          & $exe copy --mode=restore --from=a.img.zst --to=c.bin
+          if ((Get-FileHash a.bin).Hash -ne (Get-FileHash c.bin).Hash) { throw 'smart copy differs' }
+          'PASS'
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/release/dd-gui.exe -DestinationPath "dist/dd-gui-$version-windows-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dd-gui-windows-arm64
+          path: dist/*
+          if-no-files-found: error
+
   # dd-gui.exe cross-built from Linux with MinGW, so that keeps working (build.rs embeds the
-  # icon with x86_64-w64-mingw32-windres there). The release exe is the MSVC one above.
+  # icon with x86_64-w64-mingw32-windres there).
   windows-gnu-cross:
     name: dd-gui.exe cross-built on Linux (MinGW)
     runs-on: ubuntu-latest
@@ -132,6 +262,6 @@ jobs:
         env:
           CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-        run: cargo build --release --target x86_64-pc-windows-gnu
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu
       - name: Check dd-gui.exe's icon, version info and manifest
         run: python3 packaging/windows/check-exe.py target/x86_64-pc-windows-gnu/release/dd-gui.exe

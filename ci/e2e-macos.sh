@@ -120,7 +120,7 @@ def listing():
     return plist("diskutil", "list", "-plist").get("AllDisksAndPartitions", [])
 
 
-def whole_disk(_):
+def whole_disk():
     """The whole disk in `hdiutil attach -plist` output (stdin)."""
     for entity in plistlib.loads(sys.stdin.buffer.read()).get("system-entities", []):
         dev = entity.get("dev-entry", "")
