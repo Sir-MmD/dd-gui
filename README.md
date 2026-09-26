@@ -1,209 +1,107 @@
-<img src="assets/png/dd-gui-128.png" width="64" alt="DD-GUI icon">
+<p align="center">
+  <img src="assets/png/dd-gui-128.png" width="96" alt="">
+</p>
 
-# DD-GUI
+<h1 align="center">DD-GUI</h1>
 
-A simple, good-looking front end for `dd`, shipped as one self-contained file for Linux,
-Windows and macOS. Flash an image to a USB stick, back up a drive, clone one drive to
-another, or wipe one, and see exactly which `dd` command runs.
+<p align="center">
+  A desktop front end for <code>dd</code>: flash, back up, clone and wipe drives.<br>
+  Linux, Windows and macOS. One file, nothing to install.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Sir-MmD/dd-gui/releases/latest">Download</a>
+  &nbsp;·&nbsp;
+  <a href="#building">Build from source</a>
+</p>
 
 <table>
   <tr>
-    <td><img src="docs/setup.png" alt="Choosing an image and a drive"></td>
-    <td><img src="docs/copy-mode.png" alt="Choosing how to copy a drive: smart copy or sector by sector"></td>
+    <td><img src="docs/setup.png" alt="Main window"></td>
+    <td><img src="docs/copy-mode.png" alt="Choosing a copy mode"></td>
   </tr>
   <tr>
-    <td><img src="docs/progress.png" alt="Copying, with speed and time left"></td>
-    <td><img src="docs/done.png" alt="A smart backup finished: 272 MB copied into an 85.6 MB image"></td>
+    <td><img src="docs/progress.png" alt="Copy in progress"></td>
+    <td><img src="docs/done.png" alt="Finished backup"></td>
   </tr>
 </table>
 
-## What it does
+## Features
 
-- **Flash images to drives.**
-  - Plain ISO and IMG files go through the bundled `dd`.
-  - Compressed images, archives and virtual-machine disks are unpacked on the fly (see
-    [Image formats](#image-formats)).
-- **Back up or clone a drive, two ways.** DD-GUI reads the drive first, then asks:
-  - **Smart copy** copies only the space in use, e.g. 9 GB of a 64 GB stick. Backups
-    become a compressed `.img.zst` that DD-GUI writes back quickly.
-  - **Sector by sector** is plain `dd`: every byte, including free space and deleted
-    files. It works with any file system or encryption, and the image is as big as the drive.
-- **Wipe a drive** with zeros.
-- **dd options are picked for you.**
-  - Block size.
-  - Direct I/O on Linux, so progress follows the drive, not RAM.
-  - A final flush.
-  - Sparse output for backups.
-
-  Advanced settings let you override the block size, count, skip and seek, and turn on rescue
-  mode (`conv=noerror,sync`).
-- **Safe by default.**
-  - The drive your OS runs from can't be written to, and internal drives stay hidden until you ask.
-  - Drives that are too small are flagged.
-  - Writing onto the drive that holds the image is refused.
-  - Every erase asks first.
-  - Right before writing, the chosen drives are checked again, in case sticks were swapped or
-    something got mounted.
-  - Drives are unmounted (on Windows, locked) while they're copied, and mounted again afterwards.
-- **One file.** `dd` from [uutils coreutils](https://github.com/uutils/coreutils) (MIT,
-  GNU-compatible) is compiled in: `dd-gui dd if=… of=…` works like `dd` from a terminal.
-
-## Run
-
-There are no downloads yet: build DD-GUI with the script for your OS (see [Build](#build)).
-Then:
-
-- **Linux:** run `dd-gui`, or `dd-gui some-image.iso` to start with that image chosen. It asks
-  for your password (polkit) only when a drive is involved. On first start it adds its icon
-  and a menu entry to `~/.local/share`; set `DD_GUI_NO_DESKTOP_INTEGRATION=1` to skip that.
-- **macOS:** open `DD-GUI.app`. The system password prompt appears when a drive is involved.
-- **Windows:** run `dd-gui.exe`. It asks for administrator rights when it starts.
-
-The same file also works from a terminal:
-
-| Command | Does |
-|---|---|
-| `dd-gui dd if=… of=…` | the bundled `dd`, like the real one |
-| `dd-gui drives` | lists the drives as JSON |
-| `dd-gui copy …` | the copier behind smart copies and image unpacking |
+- Write disk images to USB drives and SD cards
+- Back up and clone drives, either sector by sector or used space only
+- Wipe drives
+- `dd` is built in, and the exact command is shown before it runs
+- The system drive is protected, and every erase needs confirmation
 
 ## Smart copy
 
-DD-GUI reads the drive's partition tables and each file system's own allocation map, and
-copies only the blocks in use.
+Smart copy reads the file system's allocation data and copies only the blocks in use, so a
+64 GB stick holding 9 GB of data makes a 9 GB backup. Backups are saved as `.img.zst`:
+DD-GUI skips the free space when writing them back, and `zstd -d` turns them into a regular
+raw image.
 
-| | Read |
+| Supported | |
 |---|---|
-| Partition tables | MBR, GPT, Apple partition map, BSD disklabels |
-| Windows | FAT12/16/32, exFAT, NTFS |
-| Linux | ext2/3/4, btrfs, XFS, F2FS, swap, LVM2 (the logical volumes inside are read too) |
-| Apple | APFS (including encrypted volumes), HFS+, HFSX |
-| Discs | ISO 9660, UDF |
+| File systems | FAT, exFAT, NTFS, ext2/3/4, Btrfs, XFS, F2FS, swap, APFS, HFS+, ISO 9660, UDF |
+| Partitioning | MBR, GPT, Apple partition map, BSD disklabel, LVM |
 
-Anything else is copied in full, so nothing is ever lost:
-- **Encrypted or opaque data:** LUKS, BitLocker, ZFS, ReFS, Linux RAID, bcachefs and dozens of
-  other recognised formats, or unknown data.
-- **File systems that look unsafe to trust:** not cleanly unmounted, a journal or log to
-  replay, a failed checksum, or a feature DD-GUI doesn't know.
+Other file systems, encrypted volumes and volumes that weren't cleanly unmounted are copied
+in full.
 
-Partition tables, boot areas, journals, and the first and last MiB of the drive are always
-copied. Each file system's reader was checked against that file system's own tools
-(`btrfs check`, `xfs_repair -n`, `fsck.f2fs`, `e2fsck`, `apfsck`, `fsck.hfsplus` and more) and
-file checksums: a smart copy passes them, and one with a single extent missing doesn't.
+## Supported images
 
-A smart image is a standard Zstandard file:
-- `zstd -d backup.img.zst` (or 7-Zip, or `zstdcat backup.img.zst | dd of=/dev/sdX`) gives the
-  full raw disk image, with free space as zeros.
-- DD-GUI also stores a map of the used space in a frame that other zstd tools skip, so writing
-  the image back with DD-GUI skips the free space.
-
-Smart images from earlier versions (`.img.gz`) still restore.
-
-## Image formats
-
-| Kind | Formats |
+| | |
 |---|---|
-| Raw | ISO, IMG, anything else |
-| Compressed | gzip, xz, zstd, bzip2, lz4, lzma, zip |
-| Archives (first file inside) | 7z, tar, and tar inside any of the compressed formats |
-| Virtual-machine disks | DMG (raw, zlib, bzip2, LZFSE, LZMA, ADC), VHD (fixed, dynamic), VHDX, VMDK (sparse, stream-optimized), QCOW2 (v2 and v3, compressed clusters) |
+| Disk images | ISO, IMG, DMG, VHD, VHDX, VMDK, QCOW2 |
+| Compressed | gz, xz, zst, bz2, lz4, lzma, zip |
+| Archives | 7z, tar |
 
-Encrypted images, and virtual disks that depend on another file (differencing and
-snapshot disks, backing files, split VMDKs), are refused with an explanation.
+## Download
 
-## Platforms
+| Platform | File | Requires |
+|---|---|---|
+| Linux x86_64 | `dd-gui-<version>-linux-x86_64.tar.gz` | glibc 2.28 or newer |
+| Windows x86_64 | `dd-gui-<version>-windows-x86_64.zip` | Windows 10 or newer |
+| macOS | | [Build from source](#building) |
 
-| | Drives listed with | Admin rights via | Before writing |
-|---|---|---|---|
-| Linux | `lsblk` | `pkexec` (polkit) | unmounts the partitions |
-| macOS | `diskutil` | the system password prompt | `diskutil unmountDisk`, uses `/dev/rdiskN` |
-| Windows | PowerShell (Storage module) | the app asks for admin at start | locks and dismounts the volumes |
+Writing to a drive needs administrator rights:
+- **Linux:** DD-GUI asks through polkit, or through the tool named in `DD_GUI_ELEVATE`, such as `sudo -A`.
+- **macOS:** the system password prompt appears.
+- **Windows:** DD-GUI asks when it starts.
 
-Every feature works on all three. Where an OS has no tool for something (Windows has no
-`/dev/zero`), DD-GUI's built-in copier does it.
+On Linux, DD-GUI adds itself to the application menu on first start. Set
+`DD_GUI_NO_DESKTOP_INTEGRATION=1` to prevent this.
 
-Without polkit, set `DD_GUI_ELEVATE` to another tool, e.g. `DD_GUI_ELEVATE="sudo -A"` or `doas`.
+## Building
 
-## Build
+Rust 1.93 or newer is required. The build scripts install anything else that's missing,
+after asking, and put the result in `dist/`.
 
-Each OS has a build script. It checks the build dependencies and offers to install any that
-are missing, builds the release binary, and puts the result in `dist/`. The output looks
-like pacman's.
-
-| OS | Run | You get |
+| Platform | Command | Output |
 |---|---|---|
 | Linux | `./build.sh` | `dist/dd-gui` |
-| macOS | `./build.command`, or double-click it | `dist/DD-GUI.app`, and a zip of it |
-| Windows | `build.bat`, or double-click it | `dist\dd-gui.exe` |
+| macOS | `./build.command` | `dist/DD-GUI.app` |
+| Windows | `build.bat` | `dist\dd-gui.exe` |
 
-- **Dependencies:** Rust 1.93 or newer, plus:
-  - Linux: a C compiler, pkg-config and fontconfig's headers, from the distribution's
-    package manager (pacman, apt, dnf or zypper);
-  - macOS: the Xcode Command Line Tools;
-  - Windows: the Visual C++ build tools and a Windows SDK.
+Options:
+- `--check` runs the tests.
+- `--clean` rebuilds from scratch.
+- `--noconfirm` skips the prompts.
+- `--universal` (macOS only) builds for both Apple Silicon and Intel.
 
-  Rust comes from rustup. Before installing anything, the script lists the packages and asks
-  `:: Proceed with installation? [Y/n]`.
-- **Options:**
-  - `--check` also builds and runs the tests. On Windows this needs an administrator prompt.
-  - `--clean` starts from scratch.
-  - `--noconfirm` installs missing dependencies without asking.
-  - `build.command --universal` makes one app for both Apple Silicon and Intel Macs.
-- **macOS "unidentified developer" warning:** macOS may refuse to open `build.command` from
-  a zip downloaded in a browser. Right-click it and choose Open, or run it from Terminal.
-  A `git clone` doesn't have this problem.
-- **Building by hand:** `cargo build --release` works too, once the dependencies are there.
-  `dd-gui.exe` can also be cross-built from Linux with mingw-w64:
-  `cargo build --release --target x86_64-pc-windows-gnu`.
-- **What the binary needs:**
-  - On Linux, only libc, fontconfig and freetype. X11, Wayland and OpenGL are loaded at
-    runtime if they're present, and a software renderer is built in.
-  - On Windows, `dd-gui.exe` carries its icon, version info and an administrator manifest.
-
-`.github/workflows/build.yml` builds and tests all three, and runs end-to-end tests with
-virtual disks (`ci/`). `packaging/README.md` covers the desktop entry, icons and app bundle.
-
-## How it works
+## Command line
 
 ```
-dd-gui (window, runs as you)
-  └─ pkexec dd-gui copy --ask … | dd-gui dd …      (with admin rights, only when a drive is involved)
-       ├─ reads the drive's layout and waits for your choice (copies from a drive)
-       ├─ unmounts or locks the drives
-       ├─ smart copy, image unpacking, or the bundled dd
-       └─ reports progress back; Cancel works, and it stops if the window goes away
+dd-gui [IMAGE]          open the window, optionally with an image selected
+dd-gui dd if=… of=…     run the bundled dd
+dd-gui drives           list drives as JSON
 ```
 
-## Status
+## Credits
 
-- **Linux:** tested end to end on practice drives (loop devices) with real file systems.
-  Covered: flashing, compressed images, smart and sector-by-sector backups, smart restores
-  and clones, wiping, cancelling, and failures. Results were checked with fsck and file checksums.
-- **Windows:** the exe builds with its icon, version info and manifest. Its copier and dd paths
-  pass under Wine. It hasn't run on a real Windows PC yet.
-- **macOS:** the code compiles, but it hasn't run on a real Mac yet.
-- **Build scripts:** `build.sh` is tested on Linux. `build.command` and `build.bat` were
-  checked with macOS's bash 3.2 and with PowerShell, using stand-ins for the macOS and
-  Windows tools, but haven't run on a real Mac or Windows PC yet.
-- **CI:** CI will run the Windows and macOS tests and the end-to-end scripts in `ci/` once
-  GitHub Actions runs for the repository. So far it hasn't created any runs.
-
-### A quirk in uutils dd
-
-uutils `dd` routes writes through an unaligned buffer whenever any `conv=` option is
-given. With `oflag=direct`, those writes quietly fall back to the page cache. So for drives,
-DD-GUI leaves out `conv=fsync` and flushes the drive itself after dd finishes. That's why
-the preview reads `dd … && sync`.
-
-## Licenses
-
-DD-GUI bundles:
-- **dd:** uutils coreutils (MIT).
-- **Compression:** Zstandard (BSD); flate2 and zlib-rs, lzma-rust2, zip, bzip2 with
-  libbz2-rs-sys, lz4_flex, sevenz-rust2 and lzfse_rust.
-- **UI assets:** Inter and JetBrains Mono (SIL Open Font License, see `ui/fonts/`), and
-  Lucide icons (ISC, see `ui/icons/LICENSE-lucide.txt`).
-
-The UI uses [Slint](https://slint.dev). Its royalty-free license asks for the attribution
-shown in the About dialog; alternatively, you can distribute under GPLv3. `vendor/` holds
-a copy of one Slint crate with a crash fixed (see `vendor/README.md`).
+- [uutils coreutils](https://github.com/uutils/coreutils) for `dd` (MIT)
+- [Zstandard](https://github.com/facebook/zstd) (BSD)
+- [Slint](https://slint.dev) for the user interface (Slint Royalty-free License)
+- [Inter](https://rsms.me/inter/) and [JetBrains Mono](https://www.jetbrains.com/lp/mono/) (SIL Open Font License)
+- [Lucide](https://lucide.dev) icons (ISC)

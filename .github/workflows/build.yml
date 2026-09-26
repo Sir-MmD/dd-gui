@@ -33,10 +33,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Linux build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-
       # zstd-sys compiles libzstd's C with the runner's own compiler (gcc, clang or MSVC).
       - name: Test
         run: cargo test --release

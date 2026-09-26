@@ -1036,6 +1036,7 @@ dependencies = [
  "bzip2",
  "embed-manifest",
  "flate2",
+ "fontique",
  "libc",
  "lz4_flex",
  "lzfse_rust",

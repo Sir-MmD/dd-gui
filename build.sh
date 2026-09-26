@@ -145,7 +145,7 @@ took() { # seconds → "6m 02s"
 }
 
 # ---------------------------------------------------------------------------------------
-# Build dependencies: Rust, a C compiler (libzstd), pkg-config and fontconfig's headers.
+# Build dependencies: Rust and a C compiler (for libzstd).
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -186,16 +186,8 @@ package_for() {
     case $PM:$1 in
         pacman:rust) echo rust ;;
         pacman:cc) echo gcc ;;
-        pacman:pkg-config) echo pkgconf ;;
-        pacman:fontconfig) echo fontconfig ;;
         apt-get:cc) echo build-essential ;;
-        apt-get:pkg-config) echo pkg-config ;;
-        apt-get:fontconfig)
-            if apt-cache show libfontconfig-dev >/dev/null 2>&1; then echo libfontconfig-dev; else echo libfontconfig1-dev; fi ;;
         dnf:cc | zypper:cc) echo gcc ;;
-        dnf:pkg-config) echo pkgconf-pkg-config ;;
-        zypper:pkg-config) echo pkg-config ;;
-        dnf:fontconfig | zypper:fontconfig) echo fontconfig-devel ;;
         *:curl) echo curl ;;
     esac
 }
@@ -218,8 +210,6 @@ cc_version() {
     done
     return 1
 }
-
-pkg_config() { if have pkg-config; then pkg-config "$@"; elif have pkgconf; then pkgconf "$@"; else return 1; fi; }
 
 # Lists what's there and fills MISSING (dependencies), PACKAGES (to install) and RUST_PLAN.
 MISSING=() PACKAGES=() RUST_PLAN=''
@@ -250,22 +240,6 @@ check_deps() {
     fi
 
     if v=$(cc_version); then row cc "$v"; else missing_row cc; MISSING+=(cc); PACKAGES+=("$(package_for cc)"); fi
-
-    if v=$(pkg_config --version 2>/dev/null); then
-        row pkg-config "$v"
-        if v=$(pkg_config --modversion fontconfig 2>/dev/null); then
-            row fontconfig "$v"
-        else
-            missing_row fontconfig
-            MISSING+=(fontconfig)
-            PACKAGES+=("$(package_for fontconfig)")
-        fi
-    else
-        missing_row pkg-config
-        missing_row fontconfig
-        MISSING+=(pkg-config fontconfig)
-        PACKAGES+=("$(package_for pkg-config)" "$(package_for fontconfig)")
-    fi
 }
 
 as_root() {
@@ -482,7 +456,7 @@ usage() {
 Usage: ./build.sh [options]
 
 Builds $NAME $VERSION for Linux into dist/$NAME. Missing build dependencies (Rust $RUST_MIN
-or newer, a C compiler, pkg-config, fontconfig) are installed after asking.
+or newer, a C compiler) are installed after asking.
 
 Options:
   -c, --check       also build and run the tests
