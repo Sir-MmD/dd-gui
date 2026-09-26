@@ -121,11 +121,18 @@ def listing():
 
 
 def whole_disk():
-    """The whole disk in `hdiutil attach -plist` output (stdin)."""
+    """The whole disk in `hdiutil attach -plist` output (stdin): the one with the partition
+    table, not a synthesized APFS container that macOS may list along with it."""
+    disks = []
     for entity in plistlib.loads(sys.stdin.buffer.read()).get("system-entities", []):
         dev = entity.get("dev-entry", "")
         if re.fullmatch(r"/dev/disk\d+", dev):
-            return dev
+            if entity.get("content-hint") in ("GUID_partition_scheme", "FDisk_partition_scheme", "Apple_partition_scheme"):
+                return dev
+            disks.append(dev)
+    if disks:
+        # A synthesized container gets a higher number than the disk it lives on.
+        return min(disks, key=lambda d: int(d[len("/dev/disk"):]))
     sys.exit("hdiutil attached no whole disk")
 
 
