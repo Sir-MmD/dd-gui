@@ -489,7 +489,13 @@ mod tests {
         let plan = Plan { source: &source, target: &target, opts: &o, drives: &[] };
         assert!(plan.problem().is_none());
         assert_eq!(plan.total_bytes(), Some(5_000_000_000));
-        let expected = if DIRECT_IO_AVAILABLE {
+        // macOS and Windows raw drives take whole blocks, so the image's last one is padded
+        // (5 GB isn't a multiple of 4 KiB). Windows quotes its own way and has no `sync`.
+        let expected = if cfg!(windows) {
+            r#"dd if="/home/me/My Images/os.iso" of=/dev/sdb bs=4M iflag=fullblock conv=notrunc,nocreat,sync status=progress"#
+        } else if cfg!(target_os = "macos") {
+            "dd if='/home/me/My Images/os.iso' of=/dev/sdb bs=4M iflag=fullblock conv=sync status=progress && sync"
+        } else if DIRECT_IO_AVAILABLE {
             "dd if='/home/me/My Images/os.iso' of=/dev/sdb bs=4M oflag=direct status=progress && sync"
         } else {
             "dd if='/home/me/My Images/os.iso' of=/dev/sdb bs=4M status=progress && sync"
@@ -565,13 +571,16 @@ mod tests {
     #[test]
     fn root_mount_counts_when_nothing_more_specific_does() {
         let home = std::env::temp_dir();
+        let real = plain_path(&home.canonicalize().unwrap());
+        // "/", or the drive's root ("C:\") on Windows.
+        let root = Path::new(&real).ancestors().last().unwrap().to_string_lossy().into_owned();
         let mut system = usb(256_000_000_000);
         system.path = "/dev/nvme0n1".into();
-        system.mountpoints = vec!["/".into()];
+        system.mountpoints = vec![root];
         let file = home.join("backup.img");
         assert!(lives_on(&file, &system, std::slice::from_ref(&system)));
         let mut tmp_drive = usb(8_000_000_000);
-        tmp_drive.mountpoints = vec![home.canonicalize().unwrap().to_string_lossy().into_owned()];
+        tmp_drive.mountpoints = vec![real];
         assert!(!lives_on(&file, &system, &[system.clone(), tmp_drive]));
     }
 

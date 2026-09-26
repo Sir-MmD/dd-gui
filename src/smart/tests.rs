@@ -643,12 +643,17 @@ pub(crate) mod linux {
     fn ext_free_blocks(img: &Path) -> (Vec<(u64, u64)>, u64) {
         let out = sh("dumpe2fs", &[p(img)]);
         let block = number_after(&out, "Block size:").unwrap();
+        // With bigalloc, space is free a cluster at a time. dumpe2fs before 1.47 ends each
+        // range at the first block of its last cluster ("9600-11136" for 9600-11199), so
+        // ranges are taken to their cluster's end.
+        let per_cluster = number_after(&out, "Cluster size:").map_or(1, |c| (c / block).max(1));
         let mut free = Vec::new();
         // Per group (indented); the superblock's total has the same name.
         for line in out.lines().filter_map(|l| l.strip_prefix("  Free blocks: ")) {
             for range in line.split(", ").filter(|r| !r.trim().is_empty()) {
                 let (a, b) = range.split_once('-').unwrap_or((range, range));
-                free.push((a.trim().parse().unwrap(), b.trim().parse().unwrap()));
+                let b: u64 = b.trim().parse().unwrap();
+                free.push((a.trim().parse().unwrap(), b - b % per_cluster + per_cluster - 1));
             }
         }
         (free, block)

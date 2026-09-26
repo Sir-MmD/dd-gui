@@ -1040,7 +1040,7 @@ fn restores_images_made_by_other_tools() {
         // Several frames (from pipes, so without sizes), with a skippable frame in between,
         // and a long window.
         sh(&format!(
-            "head -c 5000000 {r} | zstd -q > {o}; printf '\\x50\\x2a\\x4d\\x18\\x03\\x00\\x00\\x00abc' >> {o}; tail -c +5000001 {r} | zstd -q --long=31 >> {o}",
+            "head -c 5000000 {r} | zstd -q > {o}; printf '\\120\\052\\115\\030\\003\\000\\000\\000abc' >> {o}; tail -c +5000001 {r} | zstd -q --long=31 >> {o}",
             r = q(&raw),
             o = q(&dir.path("frames.zst"))
         ));

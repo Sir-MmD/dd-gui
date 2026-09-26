@@ -160,15 +160,11 @@ fn run(cmd: &mut Command) {
     );
 }
 
-/// Runs a command with its output going to (the end of) `to`.
+/// Runs a command with its output going to (the end of) `to`. The output is collected
+/// first: MSYS programs, such as Git for Windows' gzip, can't write to an append-only handle.
 fn run_to(cmd: &mut Command, to: &Path) {
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(to)
-        .unwrap();
     let out = cmd
-        .stdout(file)
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .unwrap_or_else(|e| panic!("couldn't run {cmd:?}: {e}"));
@@ -177,6 +173,12 @@ fn run_to(cmd: &mut Command, to: &Path) {
         "{cmd:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(to)
+        .unwrap();
+    file.write_all(&out.stdout).unwrap();
 }
 
 fn qemu_img(args: &[&str], from: &Path, to: &Path) {

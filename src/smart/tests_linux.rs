@@ -682,6 +682,15 @@ fn btrfs_physical(img: &Path, logical: u64) -> u64 {
 // XFS.
 
 /// An XFS image made from `files`.
+/// Whether mkfs.xfs can fill an image from a directory (`-p <dir>`). Older xfsprogs, such
+/// as Ubuntu 22.04's 5.13, only take proto files.
+fn xfs_fills_from_dir(s: &Scratch) -> bool {
+    let src = fresh(s, "probe-src");
+    let ok = supports(s, "mkfs.xfs", &["-q", "-f", "-p", p(&src)], 320 * MB);
+    let _ = fs::remove_dir_all(&src);
+    ok
+}
+
 fn xfs_image(s: &Scratch, name: &str, size: u64, args: &[&str], files: &Tree) -> PathBuf {
     let img = s.join(name);
     let src = fresh(s, &format!("{name}-src"));
@@ -884,6 +893,9 @@ fn xfs_unclean_log_or_damage_is_copied_in_full() {
         return;
     }
     let s = Scratch::new("xfs-damage");
+    if !xfs_fills_from_dir(&s) {
+        return;
+    }
     let size = 320 * MB;
     let mut rng = Rng(0xF6);
     let (files, _) = trees(&mut rng, 20, MB);
@@ -1502,6 +1514,9 @@ fn lvm_hand_made_volume_group() {
         return;
     }
     let s = Scratch::new("lvm");
+    if !xfs_fills_from_dir(&s) {
+        return;
+    }
     let mut rng = Rng(0x1F3);
     let (img, lvs, contents) = hand_pv(&s, &mut rng);
     let size = file_size(&img);
@@ -2077,7 +2092,9 @@ fn corrupted_linux_metadata_never_panics() {
         fuzz(name, fs::read(&btrfs).unwrap(), 128 * MB, &hot, &mut rng, rounds);
         fs::remove_file(&btrfs).unwrap();
     }
-    for (name, args) in [("xfs", &[][..]), ("xfs v4", &["-m", "crc=0"][..])] {
+    let xfs_variants: &[(&str, &[&str])] =
+        if xfs_fills_from_dir(&s) { &[("xfs", &[]), ("xfs v4", &["-m", "crc=0"])] } else { &[] };
+    for &(name, args) in xfs_variants {
         let xfs = xfs_image(&s, "xfs.img", 300 * MB, args, &files);
         // Each AG's first blocks (headers, tree roots), and the log's start.
         let (agblocks, block) = (xfs_field(&xfs, "agblocks"), xfs_field(&xfs, "blocksize"));
