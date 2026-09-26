@@ -226,12 +226,14 @@ jobs:
         shell: pwsh
         run: |
           $exe = (Resolve-Path target/release/dd-gui.exe).Path
+          # dd-gui.exe is a GUI-subsystem exe: PowerShell only waits for it when its output is piped.
+          function Run { & $exe @args | Out-Host; if ($LASTEXITCODE -ne 0) { throw "dd-gui.exe $args failed: $LASTEXITCODE" } }
           $bytes = New-Object byte[] (16MB); (New-Object Random 7).NextBytes($bytes)
           [IO.File]::WriteAllBytes("$PWD\a.bin", $bytes)
-          & $exe dd if=a.bin of=b.bin bs=4M
+          Run dd "if=$PWD\a.bin" "of=$PWD\b.bin" bs=4M
           if ((Get-FileHash a.bin).Hash -ne (Get-FileHash b.bin).Hash) { throw 'dd copy differs' }
-          & $exe copy --mode=smart --from=a.bin --to=a.img.zst
-          & $exe copy --mode=restore --from=a.img.zst --to=c.bin
+          Run copy --mode=smart "--from=$PWD\a.bin" "--to=$PWD\a.img.zst"
+          Run copy --mode=restore "--from=$PWD\a.img.zst" "--to=$PWD\c.bin"
           if ((Get-FileHash a.bin).Hash -ne (Get-FileHash c.bin).Hash) { throw 'smart copy differs' }
           'PASS'
       - name: Package

@@ -338,8 +338,24 @@ sync
 pass "source disk built: $(tr '\n' ' ' <"$W/kinds.txt")"
 
 # Checks every file system on DEV (fsck, unmounted), then mounts it and checks every file.
+# macOS creates a disk's partition nodes a moment after attaching it.
+wait_slices() {
+    local dev=$1 index kind
+    while read -r index kind; do
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+            [ -e "${dev}s$index" ] && break
+            sleep 0.5
+        done
+        if [ ! -e "${dev}s$index" ]; then
+            diskutil list "$dev" >&2 || true
+            fail "no ${dev}s$index ($kind) 15 s after attaching $dev"
+        fi
+    done <"$W/kinds.txt"
+}
+
 check_disk() {
     local dev=$1 what=$2 index kind raw mount container
+    wait_slices "$dev"
     for container in $(helper containers "$dev") "$dev"; do
         run diskutil unmountDisk force "$container" >/dev/null 2>&1 || true
     done
